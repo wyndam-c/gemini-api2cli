@@ -22,7 +22,7 @@ function extractText(parts: unknown): string {
       (p): p is GeminiPart =>
         typeof p === 'object' &&
         p !== null &&
-        typeof (p as Record<string, unknown>).text === 'string',
+        typeof (p as Record<string, unknown>)['text'] === 'string',
     )
     .map((p) => p.text)
     .join('');
@@ -34,7 +34,7 @@ function isGeminiContent(v: unknown): v is GeminiContent {
     typeof v === 'object' &&
     v !== null &&
     // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
-    Array.isArray((v as Record<string, unknown>).parts)
+    Array.isArray((v as Record<string, unknown>)['parts'])
   );
 }
 

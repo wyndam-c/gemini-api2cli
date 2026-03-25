@@ -19,9 +19,9 @@ function isMessageEntry(v: unknown): v is MessageEntry {
     typeof v === 'object' &&
     v !== null &&
     // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
-    typeof (v as Record<string, unknown>).role === 'string' &&
+    typeof (v as Record<string, unknown>)['role'] === 'string' &&
     // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
-    typeof (v as Record<string, unknown>).content === 'string'
+    typeof (v as Record<string, unknown>)['content'] === 'string'
   );
 }
 
