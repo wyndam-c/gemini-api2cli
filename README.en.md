@@ -28,7 +28,6 @@ package names still refer to `gemini-cli` or `a2a-server`.
 
 - Node.js >= 20
 - npm >= 10
-- Gemini CLI dependencies installed (`npm install`)
 
 ### Local Setup
 
