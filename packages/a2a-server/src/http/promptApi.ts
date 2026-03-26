@@ -1369,7 +1369,7 @@ export function createPromptApiRouter(
   const state = createPromptApiState(deps.credentialStoreRoot);
 
   // Eagerly resolve the token so it prints at startup, not on first request.
-  const token = getPromptApiToken();
+  getPromptApiToken();
 
   const router = express.Router();
 
@@ -1379,7 +1379,8 @@ export function createPromptApiRouter(
   // Auth endpoints (public — exempt from auth middleware)
   router.get('/v1/auth/check', (_req, res) => {
     const auth = _req.headers['authorization'];
-    if (auth && auth.startsWith('Bearer ') && auth.slice(7) === token) {
+    const currentToken = getPromptApiToken();
+    if (auth && auth.startsWith('Bearer ') && auth.slice(7) === currentToken) {
       return res.status(200).json({ ok: true });
     }
     return res.status(401).json({ ok: false });
@@ -1388,7 +1389,8 @@ export function createPromptApiRouter(
   router.post('/v1/auth/login', (req, res) => {
     // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
     const body = req.body as { token?: unknown };
-    if (typeof body.token === 'string' && body.token === token) {
+    const currentToken = getPromptApiToken();
+    if (typeof body.token === 'string' && body.token === currentToken) {
       return res.status(200).json({ ok: true });
     }
     return res.status(401).json({ ok: false, error: 'Invalid token.' });
