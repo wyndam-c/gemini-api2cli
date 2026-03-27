@@ -50,6 +50,11 @@ import {
 import type { FormatAdapter } from './adapters/types.js';
 import { geminiAdapter } from './adapters/geminiAdapter.js';
 import { openaiAdapter } from './adapters/openaiAdapter.js';
+import {
+  AcpProcessPool,
+  type ContentBlock,
+  type SessionNotification,
+} from './acpProcessPool.js';
 
 export const PROMPT_API_GEMINI_GENERATE_ROUTE = '/v1/gemini/generateContent';
 export const PROMPT_API_GEMINI_STREAM_ROUTE =
@@ -232,6 +237,8 @@ type PromptApiSettings = {
   extensionsEnabled: boolean;
   skillsEnabled: boolean;
   proxyUrl: string;
+  acpEnabled: boolean;
+  acpIdleTimeoutMs: number;
 };
 
 type PromptApiState = {
@@ -239,6 +246,7 @@ type PromptApiState = {
   credentialStore: PromptCredentialStore;
   loginJobs: Map<string, PromptCredentialLoginJob>;
   settings: PromptApiSettings;
+  acpPool: AcpProcessPool | null;
   rotationIndex: number;
 };
 type PromptCredentialLoginJob = {
@@ -445,7 +453,10 @@ function createPromptApiState(credentialStoreRoot?: string): PromptApiState {
       extensionsEnabled: false,
       skillsEnabled: false,
       proxyUrl: '',
+      acpEnabled: false,
+      acpIdleTimeoutMs: 300000,
     },
+    acpPool: null,
     rotationIndex: 0,
   };
 }
@@ -1255,6 +1266,191 @@ async function runSingleJsonInvocation(
   }
 }
 
+/* ── ACP-mode request handler ── */
+
+async function getAcpWorkerAndSession(
+  deps: Required<PromptApiDependencies>,
+  state: PromptApiState,
+) {
+  if (!state.acpPool) {
+    throw new Error('ACP pool not initialized');
+  }
+
+  const credentialHomeDir = await getEffectiveSourceGeminiCliHome(deps, state);
+  const currentCredentialId =
+    await state.credentialStore.getCurrentCredentialId();
+  const credentialId = currentCredentialId ?? 'default';
+
+  const worker = await state.acpPool.getOrCreate(
+    credentialId,
+    credentialHomeDir,
+    {
+      idleTimeoutMs: state.settings.acpIdleTimeoutMs,
+      mcpEnabled: state.settings.mcpEnabled,
+      extensionsEnabled: state.settings.extensionsEnabled,
+      skillsEnabled: state.settings.skillsEnabled,
+      proxyUrl: state.settings.proxyUrl,
+    },
+  );
+
+  // Reuse default session on the worker, create only on first call
+  const sessionId = await worker.getOrCreateDefaultSession();
+  return { worker, sessionId };
+}
+
+function promptToContentBlocks(prompt: string): ContentBlock[] {
+  return [{ type: 'text', text: prompt }];
+}
+
+function extractErrorMessage(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  if (typeof err === 'string') return err;
+  if (typeof err === 'object' && err !== null) {
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
+    const obj = err as Record<string, unknown>;
+    if (typeof obj['message'] === 'string') return obj['message'];
+    try {
+      return JSON.stringify(err);
+    } catch {
+      return '[unknown error]';
+    }
+  }
+  return String(err);
+}
+
+async function handleAcpJsonRequest(
+  req: Request,
+  res: Response,
+  adapter: FormatAdapter,
+  deps: Required<PromptApiDependencies>,
+  state: PromptApiState,
+) {
+  const requestId = `req-${randomUUID()}`;
+  const parsed = adapter.parseRequest(req.body);
+  const model = normalizeRequestedModel(parsed.model, state);
+  const contentBlocks = promptToContentBlocks(parsed.prompt);
+
+  let worker: Awaited<ReturnType<typeof getAcpWorkerAndSession>>['worker'];
+  let sessionId: string;
+  try {
+    ({ worker, sessionId } = await getAcpWorkerAndSession(deps, state));
+  } catch (err) {
+    const msg = extractErrorMessage(err);
+    logger.error(`[ACP] Failed to get worker/session: ${msg}`);
+    return res
+      .status(500)
+      .json(adapter.buildJsonError(msg, 500, model, requestId));
+  }
+
+  let assistantText = '';
+  try {
+    await worker.prompt(
+      sessionId,
+      contentBlocks,
+      (update: SessionNotification) => {
+        if (
+          update.update.sessionUpdate === 'agent_message_chunk' &&
+          update.update.content.type === 'text'
+        ) {
+          assistantText += update.update.content.text;
+        }
+      },
+    );
+
+    return res
+      .status(200)
+      .json(adapter.buildJsonResponse(assistantText, model, requestId));
+  } catch (err) {
+    const msg = extractErrorMessage(err);
+    logger.error(`[ACP] Prompt error: ${msg}`);
+    return res
+      .status(500)
+      .json(adapter.buildJsonError(msg, 500, model, requestId));
+  }
+}
+
+async function handleAcpStreamingRequest(
+  req: Request,
+  res: Response,
+  adapter: FormatAdapter,
+  deps: Required<PromptApiDependencies>,
+  state: PromptApiState,
+) {
+  const requestId = `req-${randomUUID()}`;
+  const parsed = adapter.parseRequest(req.body);
+  const model = normalizeRequestedModel(parsed.model, state);
+  const contentBlocks = promptToContentBlocks(parsed.prompt);
+
+  let worker: Awaited<ReturnType<typeof getAcpWorkerAndSession>>['worker'];
+  let sessionId: string;
+  try {
+    ({ worker, sessionId } = await getAcpWorkerAndSession(deps, state));
+  } catch (err) {
+    const msg = extractErrorMessage(err);
+    logger.error(`[ACP] Failed to get worker/session (stream): ${msg}`);
+    res.setHeader('Content-Type', adapter.streamContentType);
+    res.flushHeaders();
+    res.write(adapter.formatStreamError(msg, model, requestId));
+    res.end();
+    return;
+  }
+
+  res.setHeader('Content-Type', adapter.streamContentType);
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders();
+
+  let isFirst = true;
+  let cancelled = false;
+
+  const abortHandler = () => {
+    cancelled = true;
+    worker.cancelPrompt(sessionId).catch(() => {});
+  };
+
+  req.on('aborted', abortHandler);
+  res.on('close', abortHandler);
+
+  try {
+    await worker.prompt(
+      sessionId,
+      contentBlocks,
+      (update: SessionNotification) => {
+        if (cancelled) return;
+        if (
+          update.update.sessionUpdate === 'agent_message_chunk' &&
+          update.update.content.type === 'text'
+        ) {
+          res.write(
+            adapter.formatStreamChunk(
+              update.update.content.text,
+              model,
+              requestId,
+              isFirst,
+            ),
+          );
+          isFirst = false;
+        }
+      },
+    );
+
+    if (!cancelled) {
+      res.write(adapter.formatStreamEnd(model, requestId));
+    }
+  } catch (err) {
+    if (!cancelled) {
+      const msg = extractErrorMessage(err);
+      logger.error(`[ACP] Prompt error (stream): ${msg}`);
+      res.write(adapter.formatStreamError(msg, model, requestId));
+    }
+  } finally {
+    req.off('aborted', abortHandler);
+    res.off('close', abortHandler);
+    // Session is reused, not destroyed
+    res.end();
+  }
+}
+
 async function handleAdaptedJsonRequest(
   req: Request,
   res: Response,
@@ -1262,6 +1458,9 @@ async function handleAdaptedJsonRequest(
   deps: Required<PromptApiDependencies>,
   state: PromptApiState,
 ) {
+  if (state.settings.acpEnabled && state.acpPool) {
+    return handleAcpJsonRequest(req, res, adapter, deps, state);
+  }
   const requestId = `req-${randomUUID()}`;
   const parsed = adapter.parseRequest(req.body);
   const model = normalizeRequestedModel(parsed.model, state);
@@ -1313,6 +1512,9 @@ async function handleAdaptedStreamingRequest(
   deps: Required<PromptApiDependencies>,
   state: PromptApiState,
 ) {
+  if (state.settings.acpEnabled && state.acpPool) {
+    return handleAcpStreamingRequest(req, res, adapter, deps, state);
+  }
   const requestId = `req-${randomUUID()}`;
   const parsed = adapter.parseRequest(req.body);
   const model = normalizeRequestedModel(parsed.model, state);
@@ -1505,6 +1707,30 @@ export function createPromptApiRouter(
         }
         state.settings.proxyUrl = url;
       }
+      if (b['acpEnabled'] !== undefined) {
+        const wasEnabled = state.settings.acpEnabled;
+        state.settings.acpEnabled = Boolean(b['acpEnabled']);
+        // Destroy all ACP workers when switching off
+        if (wasEnabled && !state.settings.acpEnabled && state.acpPool) {
+          void state.acpPool.destroyAll();
+        }
+        // Lazy-create pool when switching on
+        if (state.settings.acpEnabled && !state.acpPool) {
+          state.acpPool = new AcpProcessPool({
+            cliEntryPath: deps.cliEntryPath,
+            spawnProcess: deps.spawnProcess,
+          });
+        }
+      }
+      if (b['acpIdleTimeoutMs'] !== undefined) {
+        const n = Number(b['acpIdleTimeoutMs']);
+        if (!Number.isFinite(n) || n < 0) {
+          throw new BadRequestError(
+            '"acpIdleTimeoutMs" must be a non-negative number.',
+          );
+        }
+        state.settings.acpIdleTimeoutMs = Math.floor(n);
+      }
       return res
         .status(200)
         .json({ settings: state.settings, defaultTimeoutMs: deps.timeoutMs });
@@ -1516,6 +1742,79 @@ export function createPromptApiRouter(
         error: error instanceof Error ? error.message : 'Unknown error',
       });
     }
+  });
+
+  // ── ACP Management ──
+  router.get('/v1/acp/status', (_req, res) => {
+    if (!state.acpPool) {
+      return res.status(200).json({ enabled: false, workers: [] });
+    }
+    return res.status(200).json({
+      enabled: state.settings.acpEnabled,
+      ...state.acpPool.getStatus(),
+    });
+  });
+
+  router.get('/v1/acp/sessions', (_req, res) => {
+    if (!state.acpPool) {
+      return res.status(200).json({ sessions: [] });
+    }
+    return res.status(200).json({
+      sessions: state.acpPool.getAllSessions(),
+    });
+  });
+
+  router.post('/v1/acp/sessions', async (req, res) => {
+    try {
+      if (!state.settings.acpEnabled || !state.acpPool) {
+        return res.status(400).json({ error: 'ACP mode is not enabled.' });
+      }
+      const credentialHomeDir = await getEffectiveSourceGeminiCliHome(
+        deps,
+        state,
+      );
+      const currentCredentialId =
+        await state.credentialStore.getCurrentCredentialId();
+      const credentialId = currentCredentialId ?? 'default';
+
+      const worker = await state.acpPool.getOrCreate(
+        credentialId,
+        credentialHomeDir,
+        {
+          idleTimeoutMs: state.settings.acpIdleTimeoutMs,
+          mcpEnabled: state.settings.mcpEnabled,
+          extensionsEnabled: state.settings.extensionsEnabled,
+          skillsEnabled: state.settings.skillsEnabled,
+          proxyUrl: state.settings.proxyUrl,
+        },
+      );
+      const sessionId = await worker.createSession();
+      return res.status(200).json({ sessionId, credentialId });
+    } catch (error) {
+      return res.status(500).json({
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  });
+
+  router.delete('/v1/acp/sessions/:sessionId', (req, res) => {
+    if (!state.acpPool) {
+      return res.status(400).json({ error: 'ACP mode is not enabled.' });
+    }
+    const { sessionId } = req.params as Record<string, string>;
+    const worker = state.acpPool.findWorkerBySession(sessionId);
+    if (!worker) {
+      return res.status(404).json({ error: 'Session not found.' });
+    }
+    worker.destroySession(sessionId);
+    return res.status(200).json({ ok: true });
+  });
+
+  router.delete('/v1/acp/workers', async (_req, res) => {
+    if (state.acpPool) {
+      await state.acpPool.destroyAll();
+    }
+    return res.status(200).json({ ok: true });
   });
 
   router.get(PROMPT_API_MODELS_ROUTE, (_req, res) => {
@@ -1894,7 +2193,7 @@ export function createPromptApiRouter(
         .status(500)
         .json(
           openaiAdapter.buildJsonError(
-            error instanceof Error ? error.message : 'Unknown error',
+            extractErrorMessage(error),
             500,
             state.currentModel,
             '',

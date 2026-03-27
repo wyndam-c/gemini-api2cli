@@ -1,11 +1,4 @@
-/**
- * @license
- * Copyright 2026 gemini-api2cli contributors
- * SPDX-License-Identifier: LicenseRef-CNC-1.0
- */
-
-export function getPromptApiConsoleHtml(): string {
-  return `<!doctype html>
+<!doctype html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8"/>
@@ -488,7 +481,7 @@ const I = {
     noLoginFlow: 'No active login flow.',
     saved: 'Saved: ',
     confirmDeleteAll: 'Delete ALL managed credentials? This cannot be undone.',
-    confirmDelete: 'Delete credential?\\n',
+    confirmDelete: 'Delete credential?\n',
     loadingQuota: 'Loading quota for ',
     credentialColon: 'Credential: ',
     sessionExpired: 'Session expired.',
@@ -613,7 +606,7 @@ const I = {
     noLoginFlow: '当前没有进行中的登录流程。',
     saved: '已保存：',
     confirmDeleteAll: '确定删除全部凭据吗？此操作不可撤销。',
-    confirmDelete: '确定删除此凭据吗？\\n',
+    confirmDelete: '确定删除此凭据吗？\n',
     loadingQuota: '正在加载额度：',
     credentialColon: '凭据：',
     sessionExpired: '会话已过期。',
@@ -1301,7 +1294,7 @@ async function loadAcpStatus() {
         '<strong>' + t('acpWorker') + '</strong> ' + w.credentialId.slice(0,8) +
         ' — ' + w.sessionCount + ' ' + t('acpSessions2') +
         ' — ' + w.state +
-        ' <button class="btn btn-outline btn-sm" style="margin-left:8px;font-size:11px;color:var(--red);border-color:var(--red)" onclick="killAcpWorker(&quot;' + w.credentialId + '&quot;)">' + t('acpKillWorker') + '</button>' +
+        ' <button class="btn btn-outline btn-sm" style="margin-left:8px;font-size:11px;color:var(--red);border-color:var(--red)" onclick="killAcpWorker('' + w.credentialId + '')">' + t('acpKillWorker') + '</button>' +
         '</div>';
     }).join('');
   } catch(e) {}
@@ -1353,5 +1346,4 @@ if (S.token) {
 }
 </script>
 </body>
-</html>`;
-}
+</html>
