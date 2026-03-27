@@ -231,6 +231,7 @@ type PromptApiSettings = {
   mcpEnabled: boolean;
   extensionsEnabled: boolean;
   skillsEnabled: boolean;
+  proxyUrl: string;
 };
 
 type PromptApiState = {
@@ -371,6 +372,14 @@ function buildIsolatedChildEnv(
     env['GEMINI_SKILLS_DISABLED'] = 'true';
   }
 
+  // Proxy support for non-TUN mode
+  if (settings.proxyUrl) {
+    env['HTTP_PROXY'] = settings.proxyUrl;
+    env['HTTPS_PROXY'] = settings.proxyUrl;
+    env['http_proxy'] = settings.proxyUrl;
+    env['https_proxy'] = settings.proxyUrl;
+  }
+
   return env;
 }
 
@@ -435,6 +444,7 @@ function createPromptApiState(credentialStoreRoot?: string): PromptApiState {
       mcpEnabled: false,
       extensionsEnabled: false,
       skillsEnabled: false,
+      proxyUrl: '',
     },
     rotationIndex: 0,
   };
@@ -1485,6 +1495,15 @@ export function createPromptApiRouter(
       }
       if (b['skillsEnabled'] !== undefined) {
         state.settings.skillsEnabled = Boolean(b['skillsEnabled']);
+      }
+      if (b['proxyUrl'] !== undefined) {
+        const url = String(b['proxyUrl']).trim();
+        if (url && !/^(https?|socks[45]?):\/\//i.test(url)) {
+          throw new BadRequestError(
+            '"proxyUrl" must be a valid HTTP/SOCKS proxy URL (e.g. http://127.0.0.1:7890).',
+          );
+        }
+        state.settings.proxyUrl = url;
       }
       return res
         .status(200)

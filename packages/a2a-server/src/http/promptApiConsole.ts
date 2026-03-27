@@ -359,6 +359,13 @@ a{color:var(--accent);text-decoration:none}
           </label>
         </div>
         <div class="field">
+          <span class="label" id="t-proxy-label">Proxy</span>
+          <div class="row" style="gap:8px;align-items:center">
+            <input type="text" id="proxy-input" class="input" style="width:260px" placeholder="http://127.0.0.1:7890" value=""/>
+            <span class="toggle-hint" id="t-proxy-hint" style="margin-left:0">Leave empty to disable</span>
+          </div>
+        </div>
+        <div class="field">
           <span class="label" id="t-timeout-label">Timeout (seconds)</span>
           <div class="row" style="gap:8px;align-items:center">
             <input type="number" id="timeout-input" class="input" style="width:100px" min="0" step="10" value="0"/>
@@ -494,6 +501,9 @@ const I = {
     extensionsHint: 'Load extensions in CLI subprocess',
     skillsLabel: 'Skills',
     skillsHint: 'Enable skill discovery in CLI subprocess',
+    proxyLabel: 'Proxy',
+    proxyHint: 'Leave empty to disable',
+    proxyPlaceholder: 'http://127.0.0.1:7890',
     epGeminiGen: 'Gemini native non-streaming. Request/response in Gemini API format.',
     epGeminiStream: 'Gemini native streaming (SSE). Request in Gemini API format.',
     epOpenai: 'OpenAI-compatible chat completions. Set "stream":true for SSE streaming.',
@@ -603,6 +613,9 @@ const I = {
     extensionsHint: '在 CLI 子进程中加载扩展',
     skillsLabel: '技能',
     skillsHint: '在 CLI 子进程中启用技能发现',
+    proxyLabel: '代理',
+    proxyHint: '留空则不使用代理',
+    proxyPlaceholder: 'http://127.0.0.1:7890',
     epGeminiGen: 'Gemini 原生非流式接口，请求/响应均为 Gemini API 格式。',
     epGeminiStream: 'Gemini 原生流式接口 (SSE)，请求为 Gemini API 格式。',
     epOpenai: 'OpenAI 兼容聊天补全接口，设置 "stream":true 开启 SSE 流式。',
@@ -695,6 +708,9 @@ function applyLang() {
   $('t-extensions-hint').textContent = t('extensionsHint');
   $('t-skills-label').textContent = t('skillsLabel');
   $('t-skills-hint').textContent = t('skillsHint');
+  $('t-proxy-label').textContent = t('proxyLabel');
+  $('t-proxy-hint').textContent = t('proxyHint');
+  $('proxy-input').placeholder = t('proxyPlaceholder');
   $('t-timeout-label').textContent = t('timeoutLabel');
   $('t-timeout-hint').textContent = t('timeoutHint');
   $('save-settings-btn').textContent = t('save');
@@ -1169,6 +1185,7 @@ $('save-settings-btn').onclick = async () => {
         mcpEnabled: $('mcp-toggle').checked,
         extensionsEnabled: $('extensions-toggle').checked,
         skillsEnabled: $('skills-toggle').checked,
+        proxyUrl: $('proxy-input').value.trim(),
       }),
     });
     $('settings-meta').textContent = t('settingsSaved');
@@ -1187,6 +1204,7 @@ async function loadSettings() {
     $('mcp-toggle').checked = !!s.mcpEnabled;
     $('extensions-toggle').checked = !!s.extensionsEnabled;
     $('skills-toggle').checked = !!s.skillsEnabled;
+    $('proxy-input').value = s.proxyUrl || '';
     const timeoutSec = (s.timeoutMs || 0) / 1000;
     $('timeout-input').value = timeoutSec > 0 ? String(timeoutSec) : '0';
     const defSec = p.defaultTimeoutMs ? (p.defaultTimeoutMs / 1000) : 600;
