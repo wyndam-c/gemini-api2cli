@@ -15,12 +15,19 @@ package names still refer to `gemini-cli` or `a2a-server`.
 
 - Exposes a browser console at `/manage` (English / Chinese i18n)
 - Wraps Gemini CLI as an HTTP API service
+- **ACP persistent-process mode**: CLI processes stay alive and are reused; each
+  request gets its own session, drastically reducing latency
 - Supports managed Google OAuth credentials with switchable active account
-- Supports credential rotation (round-robin) and error retry
+- Supports credential rotation (round-robin) and **per-request automatic
+  failover** (auto-switches credential on 429 / quota exhaustion)
+- Supports Worker process pool management (configurable max workers and failover
+  workers)
 - Provides quota inspection and credential polling
 - Adds token auth (covering both Web and API requests), plus optional open-API
   mode
 - Supports both Gemini-style and OpenAI-compatible API formats
+- A2A agent protocol support (optional, enable via `ENABLE_A2A=true` environment
+  variable)
 
 ## Quick Start
 
@@ -35,10 +42,10 @@ package names still refer to `gemini-cli` or `a2a-server`.
 git clone https://github.com/afu6609/gemini-api2cli
 cd gemini-api2cli
 npm install
-npm run start:a2a-server
+npm run start:server
 ```
 
-`start:a2a-server` automatically builds `core` → `a2a-server` workspaces in
+`start:server` automatically builds `core` → `a2a-server` workspaces in
 sequence, then starts the service.
 
 Then open the management console:
@@ -52,11 +59,13 @@ On first visit you will need to enter a token. The default is `root`
 
 ### Environment Variables
 
-| Variable                  | Description          | Default   |
-| ------------------------- | -------------------- | --------- |
-| `GEMINI_PROMPT_API_TOKEN` | API / Web auth token | `root`    |
-| `CODER_AGENT_PORT`        | Server listen port   | `41242`   |
-| `CODER_AGENT_HOST`        | Server bind address  | `0.0.0.0` |
+| Variable                  | Description                                                     | Default   |
+| ------------------------- | --------------------------------------------------------------- | --------- |
+| `GEMINI_PROMPT_API_TOKEN` | API / Web auth token                                            | `root`    |
+| `CODER_AGENT_PORT`        | Server listen port                                              | `41242`   |
+| `CODER_AGENT_HOST`        | Server bind address                                             | `0.0.0.0` |
+| `ENABLE_A2A`              | Enable A2A agent protocol layer (does not affect API endpoints) | `false`   |
+| `HTTPS_PROXY`             | Proxy server address (also supports `HTTP_PROXY` etc.)          | none      |
 
 ### Docker Deployment
 
@@ -187,6 +196,16 @@ CMD ["node", "packages/a2a-server/dist/src/http/server.js"]
 | Method | Path                          | Description                                |
 | ------ | ----------------------------- | ------------------------------------------ |
 | POST   | `/v1/openai/chat/completions` | Chat Completions (supports `stream: true`) |
+
+### Worker Process Management
+
+| Method | Path                          | Description               |
+| ------ | ----------------------------- | ------------------------- |
+| GET    | `/v1/acp/status`              | View Worker pool status   |
+| GET    | `/v1/acp/sessions`            | List all active sessions  |
+| POST   | `/v1/acp/sessions`            | Manually create a session |
+| DELETE | `/v1/acp/sessions/:sessionId` | Delete a specific session |
+| DELETE | `/v1/acp/workers`             | Terminate all workers     |
 
 ### Google AI Studio Compatible Endpoints (SillyTavern & other clients)
 
@@ -358,22 +377,34 @@ Token auth and Google credential login are two independent mechanisms:
 
 Configure via `/v1/settings` or the management console:
 
-| Setting           | Description                                              | Default                          |
-| ----------------- | -------------------------------------------------------- | -------------------------------- |
-| `rotationEnabled` | Credential rotation (round-robin across all credentials) | `false`                          |
-| `retryEnabled`    | Auto-retry on error (not on timeout)                     | `false`                          |
-| `retryCount`      | Retry count (1-10)                                       | `3`                              |
-| `timeoutMs`       | Request timeout in ms, 0 means use default               | `0` (default: 600000ms / 10 min) |
+| Setting             | Description                                              | Default                          |
+| ------------------- | -------------------------------------------------------- | -------------------------------- |
+| `rotationEnabled`   | Credential rotation (round-robin across all credentials) | `true`                           |
+| `retryEnabled`      | Auto-retry on error (includes credential failover)       | `true`                           |
+| `retryCount`        | Retry count (1-10)                                       | `3`                              |
+| `timeoutMs`         | Request timeout in ms, 0 means use default               | `0` (default: 600000ms / 10 min) |
+| `maxWorkers`        | Max Worker processes, 0 means unlimited                  | `2`                              |
+| `failoverWorkers`   | Reserved failover Worker processes                       | `1`                              |
+| `acpIdleTimeoutMs`  | Worker idle timeout in ms, auto-shutdown after timeout   | `300000` (5 min)                 |
+| `proxyUrl`          | Proxy server address (HTTP/SOCKS)                        | empty                            |
+| `mcpEnabled`        | Start MCP servers in CLI subprocesses                    | `false`                          |
+| `extensionsEnabled` | Load extensions in CLI subprocesses                      | `false`                          |
+| `skillsEnabled`     | Enable skill discovery in CLI subprocesses               | `false`                          |
+
+**Credential failover**: When `retryEnabled` is on, if a request fails due to
+429 / quota exhaustion / auth failure, the system automatically selects another
+available credential and retries, up to `retryCount` times. Failed credentials
+enter a 60-second cooldown to avoid repeated failures.
 
 ```bash
 # View current settings
 curl http://localhost:41242/v1/settings -H "Authorization: Bearer root"
 
-# Enable rotation and retry
+# Enable rotation and retry, limit to 3 Worker processes
 curl -X PUT http://localhost:41242/v1/settings \
   -H "Authorization: Bearer root" \
   -H "Content-Type: application/json" \
-  -d '{"rotationEnabled":true,"retryEnabled":true,"retryCount":3,"timeoutMs":120000}'
+  -d '{"rotationEnabled":true,"retryEnabled":true,"retryCount":3,"maxWorkers":3}'
 ```
 
 ## Managed Credential Flow
@@ -408,11 +439,12 @@ The management UI at `/manage` (supports English / Chinese) provides:
 - Token auth login
 - Runtime token management / open-API mode toggle
 - Google credential login and completion
-- Active credential switching
-- Per-credential test messaging
+- Active credential switching / credential test
 - Quota inspection
 - Model selection
-- Rotation, retry, and timeout configuration
+- Rotation, retry, timeout, and proxy configuration
+- Worker process pool management (max workers, failover workers, idle timeout,
+  session monitoring)
 
 ## SillyTavern Integration
 
@@ -433,13 +465,47 @@ the model name from the path. Auth is handled via the `x-goog-api-key` header.
 > If your reverse proxy URL includes `/v1` (i.e. `http://localhost:41242/v1`),
 > the request path becomes `/v1/v1beta/models/...`, which is also supported.
 
+## Architecture
+
+On startup, the server creates an ACP (Agent Client Protocol) Worker process
+pool. Each credential maps to a persistent CLI subprocess that communicates via
+NDJSON.
+
+```
+SillyTavern / API Client
+    │
+    ▼
+prompt-api layer (/v1/openai/*, /v1beta/models/*, /v1/gemini/*)
+    │
+    ▼
+ACP Worker Process Pool
+    ├─ Worker-A (Credential A) ── Session 1, Session 2, ...
+    ├─ Worker-B (Credential B) ── Session 3, ...
+    └─ Worker-C (Credential C) ── Session 4, ...
+```
+
+- **Each HTTP request creates an independent session**: destroyed after the
+  request completes, no server-side context accumulation
+- **Worker processes are persistent and reused**: avoids cold-start overhead of
+  spawning a new process per request
+- **Credential failover**: on request failure (429 / quota exhaustion),
+  automatically switches to the next credential and retries
+- **Pool capacity management**: set `maxWorkers` to limit max processes; excess
+  workers are evicted LRU-style
+
+The A2A agent protocol layer (`/tasks`, `/.well-known/agent-card.json`, etc.) is
+disabled by default. Enable it with `ENABLE_A2A=true`. It is fully independent
+of the prompt-api layer.
+
 ## Repository Notes
 
 - Main implementation: `packages/a2a-server/src/http/promptApi.ts`
+- ACP process pool: `packages/a2a-server/src/http/acpProcessPool.ts`
 - Auth middleware: `packages/a2a-server/src/http/promptApiAuth.ts`
 - Console page: `packages/a2a-server/src/http/promptApiConsole.ts`
 - Credential store: `packages/a2a-server/src/http/promptCredentialStore.ts`
 - Format adapters: `packages/a2a-server/src/http/adapters/`
+- A2A agent executor: `packages/a2a-server/src/agent/executor.ts` (optional)
 - The runtime still depends on Gemini CLI login state and execution behavior
 
 ## Licensing
