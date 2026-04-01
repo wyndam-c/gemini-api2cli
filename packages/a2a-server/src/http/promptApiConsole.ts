@@ -225,11 +225,11 @@ a{color:var(--accent);text-decoration:none}
     <!-- Complete Login -->
     <div class="card">
       <div class="card-title" id="t-complete-login">Complete Login</div>
-      <div class="card-desc" id="t-complete-login-desc">After Google redirects to the localhost callback (browser will show an error page), copy the full URL from the address bar and paste it here.</div>
+      <div class="card-desc" id="t-complete-login-desc">After Google authorization finishes, copy the one-time authorization code shown by Google and paste it here.</div>
       <div class="stack">
         <div class="field">
-          <span class="label" id="t-callback-url">Callback URL</span>
-          <textarea id="callback-url" class="textarea" placeholder="http://127.0.0.1:.../oauth2callback?code=...&state=..."></textarea>
+          <span class="label" id="t-callback-url">Authorization Code</span>
+          <textarea id="callback-url" class="textarea" placeholder="Paste the one-time authorization code shown by Google"></textarea>
         </div>
         <div class="row">
           <button class="btn btn-primary" id="complete-login-btn">Complete Login</button>
@@ -432,10 +432,11 @@ a{color:var(--accent);text-decoration:none}
 <script>
 const TOKEN_KEY = 'gemini_prompt_api_token';
 const LANG_KEY = 'gemini_prompt_api_lang';
+const LOGIN_ID_KEY = 'gemini_prompt_api_login_id';
 const S = {
   token: localStorage.getItem(TOKEN_KEY) || '',
   lang: localStorage.getItem(LANG_KEY) || (navigator.language.startsWith('zh') ? 'zh' : 'en'),
-  loginId: null,
+  loginId: sessionStorage.getItem(LOGIN_ID_KEY),
   credentials: [],
   lastHealth: null,
   lastModels: null,
@@ -468,9 +469,9 @@ const I = {
     redirectUri: 'Redirect URI',
     redirectUriPh: 'Redirect URI...',
     completeLogin: 'Complete Login',
-    completeLoginDesc: 'After Google redirects to the localhost callback (browser will show an error page), copy the full URL from the address bar and paste it here.',
-    callbackUrl: 'Callback URL',
-    callbackUrlPh: 'http://127.0.0.1:.../oauth2callback?code=...&state=...',
+    completeLoginDesc: 'After Google authorization finishes, copy the one-time authorization code shown by Google and paste it here.',
+    callbackUrl: 'Authorization Code',
+    callbackUrlPh: 'Paste the one-time authorization code shown by Google',
     checkStatus: 'Check Status',
     credentials: 'Credentials',
     credDesc: 'Manage your OAuth credentials. Switch active credential, view quota, or delete.',
@@ -597,9 +598,9 @@ const I = {
     redirectUri: '回调地址',
     redirectUriPh: '回调地址...',
     completeLogin: '完成登录',
-    completeLoginDesc: 'Google 跳转到 localhost 回调地址后，浏览器会显示无法访问。请将地址栏中的完整 URL 复制到这里提交。',
-    callbackUrl: '回调 URL',
-    callbackUrlPh: 'http://127.0.0.1:.../oauth2callback?code=...&state=...',
+    completeLoginDesc: 'Google 授权完成后，会显示一次性授权码。请把该授权码复制到这里提交。即使 /manage 是在另一台设备上打开也可以使用。',
+    callbackUrl: '授权码',
+    callbackUrlPh: '粘贴 Google 显示的一次性授权码',
     checkStatus: '查看状态',
     credentials: '凭据管理',
     credDesc: '管理 OAuth 凭据。可切换当前凭据、查看额度或删除。',
@@ -858,7 +859,9 @@ $('token-input').onkeydown = e => { if (e.key === 'Enter') $('auth-submit').clic
 
 $('logout-btn').onclick = () => {
   S.token = '';
+  S.loginId = null;
   localStorage.removeItem(TOKEN_KEY);
+  sessionStorage.removeItem(LOGIN_ID_KEY);
   $('app').style.display = 'none';
   $('auth-screen').style.display = 'flex';
   $('token-input').value = '';
@@ -1094,9 +1097,10 @@ $('start-login-btn').onclick = async () => {
     setNotice('');
     const p = await api('/v1/credentials/login',{
       method:'POST',
-      body:JSON.stringify({label:$('login-label').value.trim()||undefined}),
+      body:JSON.stringify({label:$('login-label').value.trim()||undefined, flow:'manual_code'}),
     });
     S.loginId = p.login.loginId;
+    sessionStorage.setItem(LOGIN_ID_KEY, S.loginId);
     $('auth-url').value = p.login.authUrl||'';
     $('redirect-uri').value = p.login.redirectUri||'';
     $('login-meta').textContent = t('loginStarted')+p.credential.id;
@@ -1125,8 +1129,10 @@ $('complete-login-btn').onclick = async () => {
     if (!S.loginId) throw new Error(t('startFirst'));
     const p = await api('/v1/credentials/login/'+S.loginId+'/complete',{
       method:'POST',
-      body:JSON.stringify({callbackUrl:$('callback-url').value.trim()}),
+      body:JSON.stringify({authorizationCode:$('callback-url').value.trim()}),
     });
+    S.loginId = null;
+    sessionStorage.removeItem(LOGIN_ID_KEY);
     $('login-meta').textContent = t('loginCompleted');
     $('login-output').style.display = 'block';
     $('login-output').textContent = JSON.stringify(p, null, 2);
@@ -1165,6 +1171,7 @@ $('delete-all-btn').onclick = async () => {
     setNotice('');
     await api('/v1/credentials',{method:'DELETE'});
     S.loginId = null;
+    sessionStorage.removeItem(LOGIN_ID_KEY);
     $('auth-url').value = '';
     $('redirect-uri').value = '';
     $('callback-url').value = '';

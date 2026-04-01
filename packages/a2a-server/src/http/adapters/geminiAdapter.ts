@@ -29,6 +29,18 @@ function extractText(parts: unknown): string {
 }
 /* eslint-enable @typescript-eslint/no-unsafe-type-assertion */
 
+function toConversationLabel(role?: string): string {
+  switch (role) {
+    case 'model':
+    case 'assistant':
+      return 'Assistant';
+    case 'system':
+      return 'System';
+    default:
+      return 'User';
+  }
+}
+
 function isGeminiContent(v: unknown): v is GeminiContent {
   return (
     typeof v === 'object' &&
@@ -74,23 +86,25 @@ export class GeminiAdapter implements FormatAdapter {
       );
     }
 
-    // Build prompt: if multi-turn, concatenate history then last user message
+    // Build prompt while preserving the original role of every turn.
+    const conversation = contents.map((c) => ({
+      role: c.role,
+      text: extractText(c.parts),
+    }));
+
     let prompt: string;
-    if (contents.length === 1) {
-      prompt = extractText(contents[0].parts);
+    if (
+      conversation.length === 1 &&
+      (conversation[0].role === undefined || conversation[0].role === 'user')
+    ) {
+      prompt = conversation[0].text;
     } else {
-      const history = contents.slice(0, -1);
-      const last = contents[contents.length - 1];
-      const historyText = history
-        .map((c) => {
-          const role = c.role === 'model' ? 'Assistant' : 'User';
-          return `${role}: ${extractText(c.parts)}`;
-        })
+      prompt = conversation
+        .map((c) => `${toConversationLabel(c.role)}: ${c.text}`)
         .join('\n');
-      prompt = `${historyText}\nUser: ${extractText(last.parts)}`;
     }
 
-    if (prompt.trim().length === 0) {
+    if (!conversation.some((c) => c.text.trim().length > 0)) {
       throw new BadRequestError('Contents must contain non-empty text.');
     }
 

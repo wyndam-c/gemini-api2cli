@@ -14,6 +14,17 @@ class BadRequestError extends Error {}
 
 type MessageEntry = { role: string; content: string };
 
+function toConversationLabel(role: string): string {
+  switch (role) {
+    case 'assistant':
+      return 'Assistant';
+    case 'system':
+      return 'System';
+    default:
+      return 'User';
+  }
+}
+
 function isMessageEntry(v: unknown): v is MessageEntry {
   return (
     typeof v === 'object' &&
@@ -61,15 +72,25 @@ export class OpenAIAdapter implements FormatAdapter {
       );
     }
 
-    // Extract system prompt
-    const systemMessages = messages.filter((m) => m.role === 'system');
+    // Only lift leading system messages into the dedicated system prompt.
+    // SillyTavern and other clients may inject system messages mid-conversation
+    // (e.g. memory, context); those must stay in their original position.
+    let conversationStart = 0;
+    while (
+      conversationStart < messages.length &&
+      messages[conversationStart].role === 'system'
+    ) {
+      conversationStart += 1;
+    }
+
+    const systemMessages = messages.slice(0, conversationStart);
     const systemPrompt =
       systemMessages.length > 0
         ? systemMessages.map((m) => m.content).join('\n')
         : undefined;
 
-    // Extract conversation (non-system)
-    const conversation = messages.filter((m) => m.role !== 'system');
+    // Preserve any later system messages inside the conversation history.
+    const conversation = messages.slice(conversationStart);
     if (conversation.length === 0) {
       throw new BadRequestError(
         'Messages must contain at least one non-system message.',
@@ -78,18 +99,15 @@ export class OpenAIAdapter implements FormatAdapter {
 
     // Build prompt: if single user message, use directly; if multi-turn, format as conversation
     let prompt: string;
-    if (conversation.length === 1) {
+    if (conversation.length === 1 && conversation[0].role === 'user') {
       prompt = conversation[0].content;
     } else {
       prompt = conversation
-        .map((m) => {
-          const label = m.role === 'assistant' ? 'Assistant' : 'User';
-          return `${label}: ${m.content}`;
-        })
+        .map((m) => `${toConversationLabel(m.role)}: ${m.content}`)
         .join('\n');
     }
 
-    if (prompt.trim().length === 0) {
+    if (!conversation.some((m) => m.content.trim().length > 0)) {
       throw new BadRequestError('Messages must contain non-empty content.');
     }
 

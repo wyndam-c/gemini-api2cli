@@ -13,7 +13,11 @@ import { fileURLToPath } from 'node:url';
 import express from 'express';
 import type { Request, Response } from 'express';
 import { randomUUID } from 'node:crypto';
-import { OAuth2Client, type Credentials } from 'google-auth-library';
+import {
+  CodeChallengeMethod,
+  OAuth2Client,
+  type Credentials,
+} from 'google-auth-library';
 import {
   CodeAssistServer,
   DEFAULT_GEMINI_FLASH_LITE_MODEL,
@@ -80,6 +84,7 @@ const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
 const LOGIN_JOB_TTL_MS = 30 * 60 * 1000; // 30 minutes
 const WORKSPACE_PACKAGE_NAME = '@google/gemini-cli';
 const GEMINI_DIR_NAME = '.gemini';
+const MANUAL_CODE_REDIRECT_URI = 'https://codeassist.google.com/authcode';
 const OAUTH_CREDENTIAL_FILE_NAME = 'oauth_creds.json';
 const GOOGLE_ACCOUNTS_FILE_NAME = 'google_accounts.json';
 const AUTH_ARTIFACT_NAMES = [
@@ -204,10 +209,13 @@ type StreamJsonEvent = {
 type PromptCredentialLoginRequestBody = {
   credentialId?: unknown;
   label?: unknown;
+  flow?: unknown;
 };
 type PromptCredentialLoginCompleteRequestBody = {
   callbackUrl?: unknown;
+  authorizationCode?: unknown;
 };
+type PromptCredentialLoginFlow = 'loopback' | 'manual_code';
 
 type NormalizedPromptRequest = {
   prompt: string;
@@ -258,10 +266,12 @@ type PromptCredentialLoginJob = {
   id: string;
   status: 'awaiting_callback' | 'succeeded' | 'failed';
   credentialId: string;
+  flow: PromptCredentialLoginFlow;
   startedAt: string;
   authUrl: string;
   redirectUri: string;
   state: string;
+  codeVerifier?: string;
   finishedAt?: string;
   error?: string;
 };
@@ -809,9 +819,10 @@ async function getEffectiveSourceGeminiCliHome(
 function normalizeCredentialLoginBody(body: unknown): {
   credentialId?: string;
   label?: string;
+  flow: PromptCredentialLoginFlow;
 } {
   if (body === undefined || body === null) {
-    return {};
+    return { flow: 'loopback' };
   }
 
   if (!isObject(body)) {
@@ -838,14 +849,27 @@ function normalizeCredentialLoginBody(body: unknown): {
     );
   }
 
+  if (
+    typedBody.flow !== undefined &&
+    typedBody.flow !== 'loopback' &&
+    typedBody.flow !== 'manual_code'
+  ) {
+    throw new BadRequestError(
+      '"flow" must be either "loopback" or "manual_code" when provided.',
+    );
+  }
+
   return {
     credentialId: typedBody.credentialId?.trim(),
     label: typedBody.label?.trim(),
+    flow:
+      (typedBody.flow as PromptCredentialLoginFlow | undefined) ?? 'loopback',
   };
 }
 
 function normalizeCredentialLoginCompleteBody(body: unknown): {
-  callbackUrl: string;
+  callbackUrl?: string;
+  authorizationCode?: string;
 } {
   if (!isObject(body)) {
     throw new BadRequestError('Request body must be a JSON object.');
@@ -853,17 +877,33 @@ function normalizeCredentialLoginCompleteBody(body: unknown): {
 
   const typedBody = body as PromptCredentialLoginCompleteRequestBody;
   if (
-    typeof typedBody.callbackUrl !== 'string' ||
-    typedBody.callbackUrl.trim().length === 0
+    typedBody.callbackUrl !== undefined &&
+    (typeof typedBody.callbackUrl !== 'string' ||
+      typedBody.callbackUrl.trim().length === 0)
   ) {
     throw new BadRequestError(
-      'A non-empty string "callbackUrl" field is required.',
+      '"callbackUrl" must be a non-empty string when provided.',
+    );
+  }
+  if (
+    typedBody.authorizationCode !== undefined &&
+    (typeof typedBody.authorizationCode !== 'string' ||
+      typedBody.authorizationCode.trim().length === 0)
+  ) {
+    throw new BadRequestError(
+      '"authorizationCode" must be a non-empty string when provided.',
     );
   }
 
-  return {
-    callbackUrl: typedBody.callbackUrl.trim(),
-  };
+  const callbackUrl = typedBody.callbackUrl?.trim();
+  const authorizationCode = typedBody.authorizationCode?.trim();
+  if (!callbackUrl && !authorizationCode) {
+    throw new BadRequestError(
+      'Either a non-empty string "callbackUrl" or "authorizationCode" field is required.',
+    );
+  }
+
+  return { callbackUrl, authorizationCode };
 }
 
 async function startPromptInvocation(
@@ -963,7 +1003,12 @@ function createPromptCredentialOAuthClient(proxyUrl?: string): OAuth2Client {
   });
 }
 
-function createPromptCredentialRedirectUri(): string {
+function createPromptCredentialRedirectUri(
+  flow: PromptCredentialLoginFlow,
+): string {
+  if (flow === 'manual_code') {
+    return MANUAL_CODE_REDIRECT_URI;
+  }
   const port = 40000 + Math.floor(Math.random() * 10000);
   return `http://127.0.0.1:${port}/oauth2callback`;
 }
@@ -975,7 +1020,7 @@ async function startPromptApiCredentialLogin(
   credential: PromptApiCredentialRecord;
   loginJob: PromptCredentialLoginJob;
 }> {
-  const { credentialId, label } = normalizeCredentialLoginBody(body);
+  const { credentialId, label, flow } = normalizeCredentialLoginBody(body);
   const existingCredential = credentialId
     ? await state.credentialStore.getCredential(credentialId)
     : undefined;
@@ -991,20 +1036,35 @@ async function startPromptApiCredentialLogin(
     id: randomUUID(),
     status: 'awaiting_callback',
     credentialId: credential.id,
+    flow,
     startedAt: new Date().toISOString(),
-    redirectUri: createPromptCredentialRedirectUri(),
+    redirectUri: createPromptCredentialRedirectUri(flow),
     state: randomUUID().replaceAll('-', ''),
     authUrl: '',
   };
 
   const client = createPromptCredentialOAuthClient(state.settings.proxyUrl);
-  loginJob.authUrl = client.generateAuthUrl({
-    redirect_uri: loginJob.redirectUri,
-    access_type: 'offline',
-    prompt: 'consent',
-    scope: OAUTH_SCOPE,
-    state: loginJob.state,
-  });
+  if (flow === 'manual_code') {
+    const codeVerifier = await client.generateCodeVerifierAsync();
+    loginJob.codeVerifier = codeVerifier.codeVerifier;
+    loginJob.authUrl = client.generateAuthUrl({
+      redirect_uri: loginJob.redirectUri,
+      access_type: 'offline',
+      prompt: 'consent',
+      scope: OAUTH_SCOPE,
+      state: loginJob.state,
+      code_challenge_method: CodeChallengeMethod.S256,
+      code_challenge: codeVerifier.codeChallenge,
+    });
+  } else {
+    loginJob.authUrl = client.generateAuthUrl({
+      redirect_uri: loginJob.redirectUri,
+      access_type: 'offline',
+      prompt: 'consent',
+      scope: OAUTH_SCOPE,
+      state: loginJob.state,
+    });
+  }
   state.loginJobs.set(loginJob.id, loginJob);
 
   return {
@@ -1056,61 +1116,89 @@ async function completePromptApiCredentialLogin(
     );
   }
 
-  const { callbackUrl } = normalizeCredentialLoginCompleteBody(body);
-  let parsedCallbackUrl: URL;
-  try {
-    parsedCallbackUrl = new URL(callbackUrl);
-  } catch {
-    throw new BadRequestError('"callbackUrl" must be a valid URL.');
-  }
+  const { callbackUrl, authorizationCode } =
+    normalizeCredentialLoginCompleteBody(body);
+  let code: string;
 
-  const redirectUrl = new URL(loginJob.redirectUri);
-  if (parsedCallbackUrl.origin !== redirectUrl.origin) {
-    throw new BadRequestError(
-      'The callback URL origin does not match the login redirect URI.',
-    );
-  }
-  if (parsedCallbackUrl.pathname !== redirectUrl.pathname) {
-    throw new BadRequestError(
-      'The callback URL path does not match the login redirect URI.',
-    );
-  }
+  if (loginJob.flow === 'manual_code') {
+    if (!authorizationCode) {
+      throw new BadRequestError(
+        'The authorization code is required for a manual_code login job.',
+      );
+    }
+    code = authorizationCode;
+  } else {
+    if (!callbackUrl) {
+      throw new BadRequestError(
+        'The callback URL is required for a loopback login job.',
+      );
+    }
+    let parsedCallbackUrl: URL;
+    try {
+      parsedCallbackUrl = new URL(callbackUrl);
+    } catch {
+      throw new BadRequestError('"callbackUrl" must be a valid URL.');
+    }
 
-  const errorCode = parsedCallbackUrl.searchParams.get('error');
-  if (errorCode) {
-    const failedJob = {
-      ...loginJob,
-      status: 'failed' as const,
-      finishedAt: new Date().toISOString(),
-      error:
-        parsedCallbackUrl.searchParams.get('error_description') ?? errorCode,
-    };
-    state.loginJobs.set(loginId, failedJob);
-    throw new BadRequestError(
-      `Google OAuth returned an error: ${failedJob.error}`,
-    );
-  }
+    const redirectUrl = new URL(loginJob.redirectUri);
+    if (parsedCallbackUrl.origin !== redirectUrl.origin) {
+      throw new BadRequestError(
+        'The callback URL origin does not match the login redirect URI.',
+      );
+    }
+    if (parsedCallbackUrl.pathname !== redirectUrl.pathname) {
+      throw new BadRequestError(
+        'The callback URL path does not match the login redirect URI.',
+      );
+    }
 
-  if (parsedCallbackUrl.searchParams.get('state') !== loginJob.state) {
-    throw new BadRequestError(
-      'The callback URL state does not match the login request.',
-    );
-  }
+    const errorCode = parsedCallbackUrl.searchParams.get('error');
+    if (errorCode) {
+      const failedJob = {
+        ...loginJob,
+        status: 'failed' as const,
+        finishedAt: new Date().toISOString(),
+        error:
+          parsedCallbackUrl.searchParams.get('error_description') ?? errorCode,
+      };
+      state.loginJobs.set(loginId, failedJob);
+      throw new BadRequestError(
+        `Google OAuth returned an error: ${failedJob.error}`,
+      );
+    }
 
-  const code = parsedCallbackUrl.searchParams.get('code');
-  if (!code) {
-    throw new BadRequestError(
-      'The callback URL must include an authorization code.',
-    );
+    if (parsedCallbackUrl.searchParams.get('state') !== loginJob.state) {
+      throw new BadRequestError(
+        'The callback URL state does not match the login request.',
+      );
+    }
+
+    code = parsedCallbackUrl.searchParams.get('code') ?? '';
+    if (!code) {
+      throw new BadRequestError(
+        'The callback URL must include an authorization code.',
+      );
+    }
   }
 
   const client = createPromptCredentialOAuthClient(state.settings.proxyUrl);
   let tokens: Credentials;
   try {
-    const tokenResponse = await client.getToken({
+    const tokenRequest: {
+      code: string;
+      redirect_uri: string;
+      codeVerifier?: string;
+    } = {
       code,
       redirect_uri: loginJob.redirectUri,
-    });
+    };
+    if (loginJob.flow === 'manual_code') {
+      if (!loginJob.codeVerifier) {
+        throw new Error('Login job is missing PKCE verifier.');
+      }
+      tokenRequest.codeVerifier = loginJob.codeVerifier;
+    }
+    const tokenResponse = await client.getToken(tokenRequest);
     tokens = tokenResponse.tokens;
     client.setCredentials(tokens);
   } catch (error) {
@@ -1168,6 +1256,7 @@ function getPromptApiCredentialLoginPayload(
   return {
     loginId: loginJob.id,
     status: loginJob.status,
+    flow: loginJob.flow,
     credentialId: loginJob.credentialId,
     startedAt: loginJob.startedAt,
     authUrl: loginJob.authUrl,
@@ -1545,6 +1634,8 @@ async function handleAcpJsonRequest(
           ) {
             assistantText += update.update.content.text;
           }
+
+          logger.info(`[ACP] chunk: ${JSON.stringify(update)}\n`);
         },
       );
 
@@ -2127,14 +2218,18 @@ export function createPromptApiRouter(
   });
 
   // ── ACP Management ──
-  router.get('/v1/acp/status', (_req, res) => res.status(200).json({
+  router.get('/v1/acp/status', (_req, res) =>
+    res.status(200).json({
       enabled: true,
       ...state.acpPool.getStatus(),
-    }));
+    }),
+  );
 
-  router.get('/v1/acp/sessions', (_req, res) => res.status(200).json({
+  router.get('/v1/acp/sessions', (_req, res) =>
+    res.status(200).json({
       sessions: state.acpPool.getAllSessions(),
-    }));
+    }),
+  );
 
   router.post('/v1/acp/sessions', async (req, res) => {
     try {
