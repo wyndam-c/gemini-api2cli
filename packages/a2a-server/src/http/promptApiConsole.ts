@@ -209,6 +209,52 @@ a{color:var(--accent);text-decoration:none}
 @media(max-width:640px){
   .log-row{grid-template-columns:68px 48px 1fr;font-size:11px}
 }
+
+/* ── ACP Worker Cards (expandable) ── */
+.acp-worker{border:1px solid var(--border);border-radius:var(--radius);background:var(--surface2);margin-bottom:8px;overflow:hidden}
+.acp-worker[open]{box-shadow:0 0 0 1px var(--accent-glow)}
+.acp-worker-summary{cursor:pointer;list-style:none;padding:10px 14px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;font-size:13px}
+.acp-worker-summary::-webkit-details-marker{display:none}
+.acp-worker-summary::before{content:'▸';color:var(--text3);font-size:10px;transition:transform .15s;display:inline-block;width:10px}
+.acp-worker[open] > .acp-worker-summary::before{transform:rotate(90deg)}
+.acp-worker-summary:hover{background:var(--surface3)}
+.acp-worker-cred{font-family:var(--mono);font-weight:600;color:var(--text)}
+.acp-worker-state{font-size:11px;font-weight:600;text-transform:uppercase;padding:2px 8px;border-radius:999px;letter-spacing:.04em}
+.acp-worker-state.s-ready{background:var(--green-bg);color:var(--green)}
+.acp-worker-state.s-starting{background:var(--amber-bg);color:var(--amber)}
+.acp-worker-state.s-error,.acp-worker-state.s-dead{background:var(--red-bg);color:var(--red)}
+.acp-worker-meta{font-size:12px;color:var(--text3)}
+.acp-worker-spacer{flex:1}
+.acp-worker-body{padding:0 14px 14px;border-top:1px solid var(--border);background:var(--surface)}
+.acp-section-title{font-size:11px;font-weight:700;color:var(--text3);text-transform:uppercase;letter-spacing:.06em;margin:14px 0 8px}
+.acp-prompt-row{padding:10px 12px;background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius);margin-bottom:6px;font-size:12px}
+.acp-prompt-head{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:6px}
+.acp-prompt-id{font-family:var(--mono);color:var(--text3);font-size:11px}
+.acp-prompt-status{font-size:10px;font-weight:700;padding:2px 7px;border-radius:999px;letter-spacing:.04em;text-transform:uppercase}
+.acp-prompt-status.st-completed{background:var(--green-bg);color:var(--green)}
+.acp-prompt-status.st-in_progress{background:var(--accent-glow);color:var(--accent);animation:pulse 1.6s ease-in-out infinite}
+.acp-prompt-status.st-error{background:var(--red-bg);color:var(--red)}
+.acp-prompt-status.st-cancelled{background:var(--amber-bg);color:var(--amber)}
+.acp-prompt-meta{font-size:11px;color:var(--text3);font-family:var(--mono)}
+.acp-prompt-tokens{display:inline-flex;gap:6px;font-family:var(--mono);font-size:11px;color:var(--text2)}
+.acp-prompt-tokens span{padding:1px 6px;background:var(--surface3);border-radius:4px}
+.acp-prompt-content{margin-top:6px;display:grid;grid-template-columns:60px 1fr;gap:8px;align-items:start;font-size:12px;line-height:1.55}
+.acp-prompt-content + .acp-prompt-content{margin-top:4px}
+.acp-prompt-label{color:var(--text3);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.04em;padding-top:2px}
+.acp-prompt-text{font-family:var(--mono);font-size:11.5px;color:var(--text);background:var(--surface3);border-radius:6px;padding:6px 10px;white-space:pre-wrap;word-break:break-word;max-height:240px;overflow:auto}
+.acp-prompt-text.empty{color:var(--text3);font-style:italic}
+.acp-prompt-error{color:var(--red);font-size:11.5px;font-family:var(--mono);margin-top:4px;background:var(--red-bg);border-radius:6px;padding:6px 10px}
+.acp-quota-mini{display:flex;flex-wrap:wrap;gap:8px;font-size:12px;color:var(--text2)}
+.acp-quota-mini .acp-quota-pill{padding:3px 10px;background:var(--surface3);border:1px solid var(--border);border-radius:999px;font-family:var(--mono);font-size:11px}
+.acp-empty-mini{padding:10px;text-align:center;color:var(--text3);font-size:12px;background:var(--surface2);border:1px dashed var(--border);border-radius:var(--radius)}
+.acp-live-dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--green);animation:pulse 1.6s ease-in-out infinite;margin-right:4px;vertical-align:middle}
+.acp-live-dot.off{background:var(--text3);animation:none}
+.acp-toolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:12px}
+.acp-toolbar .acp-status-text{font-size:12px;color:var(--text3);margin-left:auto}
+@media(max-width:640px){
+  .acp-prompt-content{grid-template-columns:1fr}
+  .acp-prompt-label{padding-top:0}
+}
 </style>
 </head>
 <body>
@@ -445,6 +491,13 @@ a{color:var(--accent);text-decoration:none}
               <span class="toggle-hint" id="t-acp-idle-hint" style="margin-left:0">0 = never timeout</span>
             </div>
           </div>
+          <div class="field">
+            <span class="label" id="t-acp-keepalive-label">Keepalive Interval (seconds)</span>
+            <div class="row" style="gap:8px;align-items:center">
+              <input type="number" id="acp-keepalive-input" class="input" style="width:100px" min="0" step="30" value="540"/>
+              <span class="toggle-hint" id="t-acp-keepalive-hint" style="margin-left:0">0 = disabled — first request after long idle pays cold-start cost</span>
+            </div>
+          </div>
         </div>
         <div class="row">
           <button class="btn btn-primary btn-sm" id="save-settings-btn">Save</button>
@@ -455,12 +508,20 @@ a{color:var(--accent);text-decoration:none}
 
     <!-- ACP Sessions -->
     <div class="card" id="acp-sessions-card">
-      <div class="card-title" id="t-acp-sessions">ACP Sessions</div>
+      <div class="card-title">
+        <span class="acp-live-dot off" id="acp-live-dot" title="Auto-refresh"></span>
+        <span id="t-acp-sessions">ACP Sessions</span>
+      </div>
       <div class="card-desc" id="t-acp-sessions-desc">Manage active ACP sessions and worker processes.</div>
       <div id="acp-sessions-list" style="font-size:13px;color:var(--text2)"></div>
-      <div class="row" style="margin-top:12px;gap:8px">
+      <div class="acp-toolbar">
         <button class="btn btn-outline btn-sm" id="refresh-acp-btn" id2="t-refresh-acp">Refresh</button>
+        <label class="row" style="gap:6px;align-items:center;font-size:12px;color:var(--text3);cursor:pointer">
+          <input type="checkbox" id="acp-auto-refresh-toggle" checked style="margin:0"/>
+          <span id="t-acp-auto-refresh">Auto-refresh</span>
+        </label>
         <button class="btn btn-outline btn-sm" style="color:var(--red);border-color:var(--red)" id="kill-all-acp-btn" id2="t-kill-all-acp">Kill All Workers</button>
+        <span class="acp-status-text" id="acp-status-text"></span>
       </div>
     </div>
   </div>
@@ -625,6 +686,8 @@ const I = {
     failoverWorkersHint: 'Standby workers for instant credential failover',
     acpIdleLabel: 'Worker Idle Timeout (seconds)',
     acpIdleHint: '0 = never timeout',
+    acpKeepaliveLabel: 'Keepalive Interval (seconds)',
+    acpKeepaliveHint: '0 = disabled. Periodically refreshes OAuth + warms the gRPC channel so first request after a long lull is fast. Recommended 540 (9 min).',
     acpSessions: 'ACP Sessions',
     acpSessionsDesc: 'Manage active ACP sessions and worker processes.',
     acpNoWorkers: 'No active workers.',
@@ -633,6 +696,24 @@ const I = {
     acpWorker: 'Worker',
     acpSessions2: 'sessions',
     acpKillWorker: 'Kill',
+    acpAutoRefresh: 'Auto-refresh',
+    acpLastUpdated: 'Updated',
+    acpRecentPrompts: 'Recent prompt turns',
+    acpQuotaSection: 'Credential quota',
+    acpNoRecentPrompts: 'No prompts on this worker yet.',
+    acpPromptUser: 'In',
+    acpPromptAgent: 'Out',
+    acpPromptStatusInProgress: 'streaming',
+    acpPromptStatusCompleted: 'done',
+    acpPromptStatusError: 'error',
+    acpPromptStatusCancelled: 'cancelled',
+    acpPromptDuration: 'duration',
+    acpPromptCharsTruncated: 'truncated',
+    acpQuotaLoading: 'Loading quota...',
+    acpQuotaError: 'Quota unavailable.',
+    acpRecentLoading: 'Loading recent prompts...',
+    acpRecentError: 'Failed to load recent prompts.',
+    acpAgo: ' ago',
     epGeminiGen: 'Gemini native non-streaming. Request/response in Gemini API format.',
     epGeminiStream: 'Gemini native streaming (SSE). Request in Gemini API format.',
     epOpenai: 'OpenAI-compatible chat completions. Set "stream":true for SSE streaming.',
@@ -771,6 +852,8 @@ const I = {
     failoverWorkersHint: '预热的备用进程，故障转移时即时切换',
     acpIdleLabel: '进程空闲超时（秒）',
     acpIdleHint: '0 = 不超时',
+    acpKeepaliveLabel: '保活间隔（秒）',
+    acpKeepaliveHint: '0 = 关闭。定期刷新 OAuth 并保持 gRPC 长连接，避免长时间不用后第一次请求很慢。推荐 540（9 分钟）。',
     acpSessions: 'ACP 会话',
     acpSessionsDesc: '管理活跃的 ACP 会话和工作进程。',
     acpNoWorkers: '无活跃的工作进程。',
@@ -779,6 +862,24 @@ const I = {
     acpWorker: '进程',
     acpSessions2: '个会话',
     acpKillWorker: '终止',
+    acpAutoRefresh: '自动刷新',
+    acpLastUpdated: '更新于',
+    acpRecentPrompts: '最近的对话轮次',
+    acpQuotaSection: '凭据额度',
+    acpNoRecentPrompts: '此进程暂无对话记录。',
+    acpPromptUser: '输入',
+    acpPromptAgent: '输出',
+    acpPromptStatusInProgress: '进行中',
+    acpPromptStatusCompleted: '完成',
+    acpPromptStatusError: '错误',
+    acpPromptStatusCancelled: '已取消',
+    acpPromptDuration: '耗时',
+    acpPromptCharsTruncated: '已截断',
+    acpQuotaLoading: '加载额度中...',
+    acpQuotaError: '无法加载额度。',
+    acpRecentLoading: '加载最近对话中...',
+    acpRecentError: '无法加载最近对话。',
+    acpAgo: '前',
     epGeminiGen: 'Gemini 原生非流式接口，请求/响应均为 Gemini API 格式。',
     epGeminiStream: 'Gemini 原生流式接口 (SSE)，请求为 Gemini API 格式。',
     epOpenai: 'OpenAI 兼容聊天补全接口，设置 "stream":true 开启 SSE 流式。',
@@ -899,10 +1000,16 @@ function applyLang() {
   $('t-failover-workers-hint').textContent = t('failoverWorkersHint');
   $('t-acp-idle-label').textContent = t('acpIdleLabel');
   $('t-acp-idle-hint').textContent = t('acpIdleHint');
+  const acpKeepaliveLabelEl = $('t-acp-keepalive-label');
+  if (acpKeepaliveLabelEl) acpKeepaliveLabelEl.textContent = t('acpKeepaliveLabel');
+  const acpKeepaliveHintEl = $('t-acp-keepalive-hint');
+  if (acpKeepaliveHintEl) acpKeepaliveHintEl.textContent = t('acpKeepaliveHint');
   $('t-acp-sessions').textContent = t('acpSessions');
   $('t-acp-sessions-desc').textContent = t('acpSessionsDesc');
   $('refresh-acp-btn').textContent = t('acpRefresh');
   $('kill-all-acp-btn').textContent = t('acpKillAll');
+  const acpAutoRefreshEl = $('t-acp-auto-refresh');
+  if (acpAutoRefreshEl) acpAutoRefreshEl.textContent = t('acpAutoRefresh');
   $('save-settings-btn').textContent = t('save');
   // API
   $('t-api-endpoints').textContent = t('apiEndpoints');
@@ -998,6 +1105,9 @@ $('logout-btn').onclick = () => {
   // riding on an open SSE connection, and clear any cached entries so a
   // subsequent re-login doesn't surface the previous session's logs.
   resetLogsSession();
+  // Same idea for the ACP poll loop — no point firing 5s 401s after
+  // logout, and we want a clean slate for the next session.
+  try { stopAcpAutoRefresh(); } catch {}
 
   S.token = '';
   S.loginId = null;
@@ -1024,7 +1134,51 @@ async function api(path, opts = {}) {
     throw new Error(t('sessionExpired'));
   }
   const text = await r.text();
-  const body = text ? JSON.parse(text) : null;
+  // Reverse proxies (nginx, Cloudflare, GFE...) hand back HTML error
+  // pages on 5xx/504. Blindly JSON.parse'ing a "<!DOCTYPE html>" body
+  // throws "Unexpected token '<'" which makes the real cause invisible
+  // to the user. Sniff the content type first and translate any
+  // non-JSON response into a status-code message, falling back to a
+  // truncated snippet of the body for diagnostics.
+  const contentType = (r.headers.get('content-type') || '').toLowerCase();
+  const looksLikeJson =
+    contentType.includes('json') ||
+    (text.length > 0 && (text[0] === '{' || text[0] === '['));
+  if (!looksLikeJson) {
+    if (!r.ok) {
+      // Common upstream error pages: 502 Bad Gateway, 504 Gateway
+      // Timeout, 521/522/524 from Cloudflare. Build a message that
+      // points at the layer that's actually failing rather than the
+      // JSON parse symptom.
+      const upstream = /cloudflare/i.test(r.headers.get('server') || '')
+        ? 'Cloudflare'
+        : /nginx/i.test(r.headers.get('server') || '')
+        ? 'nginx'
+        : 'upstream proxy';
+      const hint =
+        r.status === 504 || r.status === 522 || r.status === 524
+          ? ' — request likely exceeded the proxy timeout (cold-start / long generation).'
+          : r.status === 502 || r.status === 521 || r.status === 523
+          ? ' — backend unreachable.'
+          : '';
+      throw new Error(
+        upstream + ' returned HTTP ' + r.status + ' (non-JSON body)' + hint,
+      );
+    }
+    // 2xx with HTML is unusual but possible (e.g., a misrouted /manage
+    // request). Return null so the caller's optional-chaining still
+    // works without blowing up.
+    return null;
+  }
+  let body = null;
+  try {
+    body = text ? JSON.parse(text) : null;
+  } catch (parseErr) {
+    // JSON-shaped content that didn't parse — surface a short snippet
+    // instead of the cryptic SyntaxError from JSON.parse.
+    const snippet = text.length > 80 ? text.slice(0, 80) + '...' : text;
+    throw new Error('Bad JSON response (HTTP ' + r.status + '): ' + snippet);
+  }
   if (!r.ok) throw new Error(body?.error || r.statusText || 'Request failed');
   return body;
 }
@@ -1470,6 +1624,13 @@ $('save-settings-btn').onclick = async () => {
       Number.isFinite(acpIdleRaw) && acpIdleRaw >= 0
         ? Math.floor(acpIdleRaw * 1000)
         : 0;
+    // Keepalive: same "0 = disabled" semantics — coerce explicitly so
+    // an empty/invalid input doesn't silently re-enable a default.
+    const keepaliveRaw = parseFloat($('acp-keepalive-input').value);
+    const acpKeepaliveMs =
+      Number.isFinite(keepaliveRaw) && keepaliveRaw >= 0
+        ? Math.floor(keepaliveRaw * 1000)
+        : 0;
     const p = await api('/v1/settings',{
       method:'PUT',
       body:JSON.stringify({
@@ -1484,6 +1645,7 @@ $('save-settings-btn').onclick = async () => {
         maxWorkers: parseInt($('max-workers-input').value, 10) || 0,
         failoverWorkers: parseInt($('failover-workers-input').value, 10) || 0,
         acpIdleTimeoutMs: acpIdleMs,
+        acpKeepaliveIntervalMs: acpKeepaliveMs,
       }),
     });
     $('settings-meta').textContent = t('settingsSaved');
@@ -1512,38 +1674,342 @@ async function loadSettings() {
     const acpIdleMsStored =
       typeof s.acpIdleTimeoutMs === 'number' ? s.acpIdleTimeoutMs : 0;
     $('acp-idle-input').value = String(acpIdleMsStored / 1000);
+    // Same typeof guard for the keepalive interval — fall back to the
+    // server's recommended 9-minute default only when the field is
+    // genuinely missing from the response (older server, fresh DB).
+    const keepaliveStored =
+      typeof s.acpKeepaliveIntervalMs === 'number'
+        ? s.acpKeepaliveIntervalMs
+        : 540_000;
+    const keepaliveInputEl = $('acp-keepalive-input');
+    if (keepaliveInputEl) {
+      keepaliveInputEl.value = String(keepaliveStored / 1000);
+    }
     const timeoutSec = (s.timeoutMs || 0) / 1000;
     $('timeout-input').value = timeoutSec > 0 ? String(timeoutSec) : '0';
     const defSec = p.defaultTimeoutMs ? (p.defaultTimeoutMs / 1000) : 600;
     $('t-timeout-hint').textContent = t('timeoutHint') + ' (' + defSec + 's)';
     $('open-api-toggle').checked = !!oa.openApiEnabled;
+    // First call gives the panel something to show; the polling loop
+    // started right after keeps it fresh while the user has the page
+    // open. Both are idempotent — safe to call from any settings load.
     loadAcpStatus();
+    if (AcpUI.autoRefresh) startAcpAutoRefresh();
   } catch(e) {}
 }
 
 /* ── ACP Session Management ── */
+// Track which workers are expanded so the per-worker details survive
+// across poll-driven re-renders. The list can shrink (worker died) or
+// reorder freely; we just key by credentialId.
+const AcpUI = {
+  poll: 0,                    // setInterval handle (0 = not running)
+  POLL_MS: 5000,              // refresh cadence while panel is in foreground
+  autoRefresh: true,          // mirrors the toolbar checkbox
+  lastUpdatedAt: 0,           // ms timestamp of last successful fetch
+  lastWorkers: [],            // last-known workers payload for diff/render
+  expanded: new Set(),        // credentialIds currently open
+  detailCache: new Map(),     // credentialId → { quota, prompts, fetchedAt }
+};
+
+function escapeHtml(s) {
+  if (s == null) return '';
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function formatRelative(ms, nowMs) {
+  // Human-friendly delta for a past timestamp. Returns "just now",
+  // "12s", "3m", "1h", "2d". The caller appends t('acpAgo') if it
+  // wants "5m ago"-style phrasing.
+  const delta = Math.max(0, (nowMs || Date.now()) - ms);
+  const sec = Math.floor(delta / 1000);
+  if (sec < 2) return 'just now';
+  if (sec < 60) return sec + 's';
+  const min = Math.floor(sec / 60);
+  if (min < 60) return min + 'm';
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return hr + 'h';
+  const day = Math.floor(hr / 24);
+  return day + 'd';
+}
+
+function formatDuration(ms) {
+  if (!Number.isFinite(ms) || ms < 0) return '—';
+  if (ms < 1000) return ms + 'ms';
+  return (ms / 1000).toFixed(ms < 10000 ? 2 : 1) + 's';
+}
+
+function renderAcpWorker(w, nowMs) {
+  // Build one collapsible <details> entry. The summary shows the
+  // info we always have from /v1/acp/status; the body is a host
+  // div whose inner HTML is filled in lazily when the user expands
+  // the row (see ensureWorkerDetail).
+  const credShort = w.credentialId.slice(0, 8);
+  const stateClass = 's-' + (w.state || 'unknown');
+  const isOpen = AcpUI.expanded.has(w.credentialId);
+  const lastAct = w.lastActivity
+    ? formatRelative(w.lastActivity, nowMs) + t('acpAgo')
+    : '—';
+  const recentLabel = (w.recentPromptCount || 0) + ' ' + t('acpRecentPrompts').toLowerCase();
+  return (
+    '<details class="acp-worker"' + (isOpen ? ' open' : '') +
+    ' data-cred="' + escapeHtml(w.credentialId) + '">' +
+      '<summary class="acp-worker-summary">' +
+        '<span class="acp-worker-cred">' + escapeHtml(credShort) + '</span>' +
+        '<span class="acp-worker-state ' + stateClass + '">' + escapeHtml(w.state || '') + '</span>' +
+        '<span class="acp-worker-meta">' + (w.sessionCount || 0) + ' ' + t('acpSessions2') + '</span>' +
+        '<span class="acp-worker-meta">' + escapeHtml(recentLabel) + '</span>' +
+        '<span class="acp-worker-meta">' + escapeHtml(lastAct) + '</span>' +
+        '<span class="acp-worker-spacer"></span>' +
+        '<button class="btn btn-outline btn-sm" style="font-size:11px;color:var(--red);border-color:var(--red)" ' +
+          'onclick="event.preventDefault();event.stopPropagation();killAcpWorker(&quot;' + escapeHtml(w.credentialId) + '&quot;)">' +
+          t('acpKillWorker') + '</button>' +
+      '</summary>' +
+      '<div class="acp-worker-body" data-detail-host>' +
+        '<div class="acp-section-title">' + t('acpQuotaSection') + '</div>' +
+        '<div class="acp-quota-mini" data-quota-host>' +
+          '<span class="acp-empty-mini">' + t('acpQuotaLoading') + '</span>' +
+        '</div>' +
+        '<div class="acp-section-title">' + t('acpRecentPrompts') + '</div>' +
+        '<div data-prompts-host>' +
+          '<div class="acp-empty-mini">' + t('acpRecentLoading') + '</div>' +
+        '</div>' +
+      '</div>' +
+    '</details>'
+  );
+}
+
+function renderAcpQuotaMini(payload) {
+  // Summarize the quota response into a compact pill row. The full
+  // /v1/quotas already surfaces details; here we just want to show
+  // "is this credential healthy and approximately how much is left".
+  if (!payload) {
+    return '<span class="acp-empty-mini">' + t('acpQuotaError') + '</span>';
+  }
+  const parts = [];
+  if (payload.plan) parts.push('<span class="acp-quota-pill">' + escapeHtml(String(payload.plan)) + '</span>');
+  if (payload.userTier) parts.push('<span class="acp-quota-pill">' + escapeHtml(String(payload.userTier)) + '</span>');
+  if (typeof payload.remainingRatio === 'number') {
+    parts.push('<span class="acp-quota-pill">' + Math.round(payload.remainingRatio * 100) + '% ' + t('remaining') + '</span>');
+  }
+  if (Array.isArray(payload.buckets)) {
+    let lowest = null;
+    for (const b of payload.buckets) {
+      if (typeof b.remaining === 'number' && typeof b.limit === 'number' && b.limit > 0) {
+        const ratio = b.remaining / b.limit;
+        if (lowest == null || ratio < lowest.ratio) {
+          lowest = { ratio, name: b.modelId || b.id || '', remaining: b.remaining, limit: b.limit };
+        }
+      }
+    }
+    if (lowest) {
+      parts.push('<span class="acp-quota-pill">' + Math.round(lowest.ratio * 100) + '% ' + escapeHtml(String(lowest.name || '')) + '</span>');
+    }
+  }
+  if (parts.length === 0) {
+    return '<span class="acp-empty-mini">' + t('noQuota') + '</span>';
+  }
+  return parts.join('');
+}
+
+function renderAcpPrompt(p, nowMs) {
+  const statusKey = 'acpPromptStatus' + (p.status || 'completed').replace(/^./, c => c.toUpperCase());
+  const statusLabel = t(statusKey) || p.status || '';
+  const truncatedIn = p.promptCharCount > p.promptSummary.length;
+  const truncatedOut = p.responseCharCount > p.responseSummary.length;
+  const started = p.startedAt ? formatRelative(p.startedAt, nowMs) + t('acpAgo') : '';
+  const tokenChips = [];
+  if (typeof p.inputTokens === 'number') tokenChips.push('<span>in ' + p.inputTokens + '</span>');
+  if (typeof p.outputTokens === 'number') tokenChips.push('<span>out ' + p.outputTokens + '</span>');
+  if (typeof p.totalTokens === 'number') tokenChips.push('<span>tot ' + p.totalTokens + '</span>');
+  if (typeof p.cachedTokens === 'number' && p.cachedTokens > 0) tokenChips.push('<span>cached ' + p.cachedTokens + '</span>');
+
+  const promptText = p.promptSummary
+    ? '<span class="acp-prompt-text">' + escapeHtml(p.promptSummary) +
+      (truncatedIn ? '\n<small>… +' + (p.promptCharCount - p.promptSummary.length) + ' ' + t('acpPromptCharsTruncated') + '</small>' : '') +
+      '</span>'
+    : '<span class="acp-prompt-text empty">∅</span>';
+  const responseText = p.responseSummary
+    ? '<span class="acp-prompt-text">' + escapeHtml(p.responseSummary) +
+      (truncatedOut ? '\n<small>… +' + (p.responseCharCount - p.responseSummary.length) + ' ' + t('acpPromptCharsTruncated') + '</small>' : '') +
+      '</span>'
+    : (p.status === 'in_progress'
+        ? '<span class="acp-prompt-text empty">…</span>'
+        : '<span class="acp-prompt-text empty">∅</span>');
+
+  return (
+    '<div class="acp-prompt-row">' +
+      '<div class="acp-prompt-head">' +
+        '<span class="acp-prompt-id">' + escapeHtml(p.id || '') + '</span>' +
+        '<span class="acp-prompt-status st-' + escapeHtml(p.status || '') + '">' + escapeHtml(statusLabel) + '</span>' +
+        (started ? '<span class="acp-prompt-meta">' + escapeHtml(started) + '</span>' : '') +
+        (typeof p.durationMs === 'number'
+          ? '<span class="acp-prompt-meta">' + t('acpPromptDuration') + ' ' + escapeHtml(formatDuration(p.durationMs)) + '</span>'
+          : '') +
+        (tokenChips.length ? '<span class="acp-prompt-tokens">' + tokenChips.join('') + '</span>' : '') +
+      '</div>' +
+      (p.errorMessage
+        ? '<div class="acp-prompt-error">' + escapeHtml(p.errorMessage) + '</div>'
+        : '') +
+      '<div class="acp-prompt-content">' +
+        '<span class="acp-prompt-label">' + t('acpPromptUser') + '</span>' +
+        promptText +
+      '</div>' +
+      '<div class="acp-prompt-content">' +
+        '<span class="acp-prompt-label">' + t('acpPromptAgent') + '</span>' +
+        responseText +
+      '</div>' +
+    '</div>'
+  );
+}
+
+function renderAcpPromptList(prompts, nowMs) {
+  if (!Array.isArray(prompts) || prompts.length === 0) {
+    return '<div class="acp-empty-mini">' + t('acpNoRecentPrompts') + '</div>';
+  }
+  // Newest first in the UI; backend stores newest-last.
+  const ordered = prompts.slice().reverse();
+  return ordered.map(p => renderAcpPrompt(p, nowMs)).join('');
+}
+
+async function fetchAcpWorkerDetail(credentialId) {
+  // Fetch quota + recent prompts in parallel. Either may fail
+  // independently — render whatever we got.
+  const results = await Promise.allSettled([
+    api('/v1/quotas/' + encodeURIComponent(credentialId)),
+    api('/v1/acp/workers/' + encodeURIComponent(credentialId) + '/recent'),
+  ]);
+  const quota = results[0].status === 'fulfilled' ? results[0].value : null;
+  const promptsResp = results[1].status === 'fulfilled' ? results[1].value : null;
+  return {
+    quota,
+    prompts: promptsResp && Array.isArray(promptsResp.prompts) ? promptsResp.prompts : null,
+    fetchedAt: Date.now(),
+  };
+}
+
+async function refreshAcpWorkerDetailDom(credentialId) {
+  // Re-fetch + repaint the detail body for one open worker. Called
+  // when the user expands the worker, and on every poll tick for
+  // already-open workers.
+  const card = document.querySelector('details.acp-worker[data-cred="' + cssEscape(credentialId) + '"]');
+  if (!card) return;
+  const quotaHost = card.querySelector('[data-quota-host]');
+  const promptsHost = card.querySelector('[data-prompts-host]');
+  let detail;
+  try {
+    detail = await fetchAcpWorkerDetail(credentialId);
+    AcpUI.detailCache.set(credentialId, detail);
+  } catch (e) {
+    if (quotaHost) quotaHost.innerHTML = '<span class="acp-empty-mini">' + t('acpQuotaError') + '</span>';
+    if (promptsHost) promptsHost.innerHTML = '<div class="acp-empty-mini">' + t('acpRecentError') + '</div>';
+    return;
+  }
+  const nowMs = Date.now();
+  if (quotaHost) quotaHost.innerHTML = renderAcpQuotaMini(detail.quota);
+  if (promptsHost) promptsHost.innerHTML = renderAcpPromptList(detail.prompts || [], nowMs);
+}
+
+// Lightweight CSS.escape polyfill — older browsers may not have it.
+function cssEscape(s) {
+  if (typeof CSS !== 'undefined' && typeof CSS.escape === 'function') {
+    return CSS.escape(s);
+  }
+  return String(s).replace(/[^a-zA-Z0-9_-]/g, ch => '\\' + ch);
+}
+
+function updateAcpStatusText() {
+  const el = $('acp-status-text');
+  if (!el) return;
+  if (!AcpUI.lastUpdatedAt) {
+    el.textContent = '';
+    return;
+  }
+  el.textContent = t('acpLastUpdated') + ' ' + formatRelative(AcpUI.lastUpdatedAt) + t('acpAgo');
+}
+
+function setAcpLiveDot(on) {
+  const dot = $('acp-live-dot');
+  if (!dot) return;
+  dot.classList.toggle('off', !on);
+}
+
 async function loadAcpStatus() {
   try {
     const st = await api('/v1/acp/status');
-    const el = $('acp-sessions-list');
-    if (!st.workers || st.workers.length === 0) {
-      el.textContent = t('acpNoWorkers');
-      return;
+    AcpUI.lastWorkers = Array.isArray(st.workers) ? st.workers : [];
+    AcpUI.lastUpdatedAt = Date.now();
+
+    // Drop "expanded" entries for workers that no longer exist so the
+    // open-set doesn't grow unboundedly across worker churn.
+    const live = new Set(AcpUI.lastWorkers.map(w => w.credentialId));
+    for (const id of AcpUI.expanded) {
+      if (!live.has(id)) AcpUI.expanded.delete(id);
     }
-    el.innerHTML = st.workers.map(function(w) {
-      return '<div style="padding:6px 0;border-bottom:1px solid var(--border)">' +
-        '<strong>' + t('acpWorker') + '</strong> ' + w.credentialId.slice(0,8) +
-        ' — ' + w.sessionCount + ' ' + t('acpSessions2') +
-        ' — ' + w.state +
-        ' <button class="btn btn-outline btn-sm" style="margin-left:8px;font-size:11px;color:var(--red);border-color:var(--red)" onclick="killAcpWorker(&quot;' + w.credentialId + '&quot;)">' + t('acpKillWorker') + '</button>' +
-        '</div>';
-    }).join('');
-  } catch(e) {}
+    for (const id of Array.from(AcpUI.detailCache.keys())) {
+      if (!live.has(id)) AcpUI.detailCache.delete(id);
+    }
+
+    const el = $('acp-sessions-list');
+    if (!el) return;
+    if (AcpUI.lastWorkers.length === 0) {
+      el.innerHTML = '<div class="acp-empty-mini">' + t('acpNoWorkers') + '</div>';
+    } else {
+      const nowMs = Date.now();
+      el.innerHTML = AcpUI.lastWorkers.map(w => renderAcpWorker(w, nowMs)).join('');
+    }
+    updateAcpStatusText();
+
+    // After the DOM is updated, repaint the body of every still-open
+    // worker. This is what gives the user "live" feel for the
+    // currently-streaming prompt.
+    for (const credentialId of AcpUI.expanded) {
+      // Fire and forget — each detail fetch races independently.
+      void refreshAcpWorkerDetailDom(credentialId);
+    }
+  } catch (e) {
+    // Network blip — keep the UI quiet (the dot reflects connectivity
+    // already) and try again on the next tick.
+    setAcpLiveDot(false);
+    return;
+  }
+  if (AcpUI.autoRefresh) setAcpLiveDot(true);
+}
+
+function startAcpAutoRefresh() {
+  if (AcpUI.poll) return;
+  AcpUI.poll = setInterval(() => {
+    // Skip ticks while the page is hidden — saves token churn and
+    // browser CPU. We'll catch up on the next tick after focus.
+    if (document.visibilityState !== 'visible') return;
+    if (!AcpUI.autoRefresh) return;
+    void loadAcpStatus();
+  }, AcpUI.POLL_MS);
+  setAcpLiveDot(true);
+}
+
+function stopAcpAutoRefresh() {
+  if (AcpUI.poll) {
+    clearInterval(AcpUI.poll);
+    AcpUI.poll = 0;
+  }
+  setAcpLiveDot(false);
 }
 
 window.killAcpWorker = async function(credentialId) {
   try {
+    // The DELETE /v1/acp/workers endpoint kills all workers; this
+    // matches the server-side handler today (no per-credential
+    // route exists). We surface the per-row Kill button anyway so
+    // the user can act on the worker they're inspecting.
     await api('/v1/acp/workers',{method:'DELETE'});
+    AcpUI.expanded.delete(credentialId);
+    AcpUI.detailCache.delete(credentialId);
     await loadAcpStatus();
   } catch(e) { showErr(e); }
 };
@@ -1552,9 +2018,54 @@ $('refresh-acp-btn').onclick = () => loadAcpStatus();
 $('kill-all-acp-btn').onclick = async () => {
   try {
     await api('/v1/acp/workers',{method:'DELETE'});
+    AcpUI.expanded.clear();
+    AcpUI.detailCache.clear();
     await loadAcpStatus();
   } catch(e) { showErr(e); }
 };
+
+const acpAutoToggle = $('acp-auto-refresh-toggle');
+if (acpAutoToggle) {
+  acpAutoToggle.onchange = () => {
+    AcpUI.autoRefresh = !!acpAutoToggle.checked;
+    if (AcpUI.autoRefresh) {
+      startAcpAutoRefresh();
+      void loadAcpStatus();
+    } else {
+      stopAcpAutoRefresh();
+    }
+  };
+}
+
+// Use the bubbling 'toggle' event from <details> elements to track
+// expand/collapse without binding a listener per card. Caveat:
+// 'toggle' does not bubble in some older browsers — so we delegate
+// at the click level too as a fallback.
+document.addEventListener('toggle', (ev) => {
+  const target = ev.target;
+  if (!(target instanceof HTMLElement)) return;
+  if (!target.classList.contains('acp-worker')) return;
+  const cred = target.getAttribute('data-cred');
+  if (!cred) return;
+  if (target.hasAttribute('open')) {
+    AcpUI.expanded.add(cred);
+    void refreshAcpWorkerDetailDom(cred);
+  } else {
+    AcpUI.expanded.delete(cred);
+  }
+}, true);
+
+// Resume / pause polling with tab visibility — avoids both wasted
+// background polls and a stale UI when the user comes back.
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && AcpUI.autoRefresh) {
+    void loadAcpStatus();
+  }
+});
+
+// The polling loop is started inside loadSettings() (after auth)
+// rather than at module load — see startAcpAutoRefresh call in
+// loadSettings to avoid 5s 401 spam before the user signs in.
 
 function showErr(e) {
   setNotice(e instanceof Error ? e.message : String(e));

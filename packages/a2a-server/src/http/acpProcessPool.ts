@@ -34,6 +34,50 @@ export interface AcpWorkerInfo {
   state: AcpWorkerState;
   sessionCount: number;
   lastActivity: number;
+  /** Number of prompt records retained in the in-memory ring buffer. */
+  recentPromptCount: number;
+}
+
+/** Status of a recorded prompt turn. */
+export type AcpPromptStatus =
+  | 'in_progress'
+  | 'completed'
+  | 'error'
+  | 'cancelled';
+
+/**
+ * One prompt turn recorded for the admin console. Holds truncated
+ * summaries of the user prompt and assistant reply plus token usage —
+ * enough to be useful in the UI without unbounded memory growth.
+ *
+ * Ephemeral by design: the server keeps only the last N records per
+ * worker (see {@link MAX_RECENT_PROMPTS_PER_WORKER}); the worker exits
+ * along with its history when the credential is removed or the worker
+ * idle-times-out.
+ */
+export interface AcpPromptRecord {
+  /** Worker-local sequence id ("p1", "p2", ...). */
+  id: string;
+  acpSessionId: string;
+  startedAt: number;
+  finishedAt?: number;
+  durationMs?: number;
+  status: AcpPromptStatus;
+  /** First {@link PROMPT_SUMMARY_CAP} chars of the user content. */
+  promptSummary: string;
+  /** Total user-content character count (across all text blocks). */
+  promptCharCount: number;
+  /** First {@link PROMPT_SUMMARY_CAP} chars of the streamed agent reply. */
+  responseSummary: string;
+  /** Total assistant-content character count streamed back. */
+  responseCharCount: number;
+  errorMessage?: string;
+  /** Prompt-turn token usage as reported by the agent (when available). */
+  inputTokens?: number;
+  outputTokens?: number;
+  totalTokens?: number;
+  cachedTokens?: number;
+  thoughtTokens?: number;
 }
 
 interface PromptListener {
@@ -55,12 +99,63 @@ export interface AcpPoolSettings {
   proxyUrl: string;
   maxWorkers: number;
   failoverWorkers: number;
+  /**
+   * Keepalive interval in ms. When a worker has been idle for this
+   * long, the pool fires a no-cost re-authenticate against the
+   * underlying CLI subprocess to refresh OAuth tokens and exercise
+   * the gRPC channel before they expire. 0 disables keepalive (the
+   * first user request after idle then pays the warm-up cost).
+   * Recommended: 540_000 (9 min) — comfortably under the typical
+   * 10-15 min HTTP/2 idle close used by Google's load balancers and
+   * the 1-hour OAuth access token TTL.
+   */
+  keepaliveIntervalMs?: number;
 }
 
 const GEMINI_DIR_NAME = '.gemini';
 // 0 means "never time out" — workers stay alive until explicit shutdown.
 // The admin console exposes this as seconds; see promptApiConsole.ts.
 const DEFAULT_IDLE_TIMEOUT_MS = 0;
+
+// Per-worker ring buffer size for recent prompts shown in the admin
+// console. 20 strikes a balance between "useful diagnostic depth" and
+// "bounded memory" — at the {@link PROMPT_SUMMARY_CAP} cap below, 20
+// records is at most ~80 KB per worker.
+const MAX_RECENT_PROMPTS_PER_WORKER = 20;
+// Per-side character cap for prompt/response summaries. The admin UI
+// only needs enough to identify the turn at a glance; full content
+// stays in caller-supplied logs.
+const PROMPT_SUMMARY_CAP = 2000;
+
+/**
+ * Best-effort textual summary of a prompt input. Walks the content
+ * blocks in order and concatenates text content until the cap is hit;
+ * non-text blocks are rendered as a placeholder so the user can still
+ * tell what was sent. Never throws — used only for diagnostics.
+ */
+function summarizePromptContent(blocks: ContentBlock[]): {
+  summary: string;
+  charCount: number;
+} {
+  let summary = '';
+  let charCount = 0;
+  for (const block of blocks) {
+    if (block.type === 'text' && typeof block.text === 'string') {
+      charCount += block.text.length;
+      if (summary.length < PROMPT_SUMMARY_CAP) {
+        const remaining = PROMPT_SUMMARY_CAP - summary.length;
+        summary += block.text.slice(0, remaining);
+      }
+    } else if (block.type === 'image') {
+      if (summary.length < PROMPT_SUMMARY_CAP) summary += '[image]';
+    } else if (block.type === 'audio') {
+      if (summary.length < PROMPT_SUMMARY_CAP) summary += '[audio]';
+    } else if (block.type === 'resource' || block.type === 'resource_link') {
+      if (summary.length < PROMPT_SUMMARY_CAP) summary += '[resource]';
+    }
+  }
+  return { summary, charCount };
+}
 
 function buildAcpChildEnv(
   isolatedHomeDir: string,
@@ -110,6 +205,15 @@ export class AcpWorker {
   private workspaceCwd: string | undefined;
   private defaultSessionId: string | undefined;
   private onDead: (() => void) | undefined;
+  // FIFO ring buffer of the most recent prompt turns this worker has
+  // handled. Bounded by MAX_RECENT_PROMPTS_PER_WORKER. Powers the
+  // admin console's expandable per-worker detail panel.
+  private recentPrompts: AcpPromptRecord[] = [];
+  private nextPromptSeq = 1;
+  // Background timer firing keepalive auth refreshes. See
+  // {@link AcpPoolSettings.keepaliveIntervalMs} for rationale.
+  private keepaliveTimer: ReturnType<typeof setInterval> | undefined;
+  private keepaliveIntervalMs = 0;
 
   constructor(
     credentialId: string,
@@ -140,11 +244,37 @@ export class AcpWorker {
       state: this._state,
       sessionCount: this.sessions.size,
       lastActivity: this._lastActivity,
+      recentPromptCount: this.recentPrompts.length,
     };
   }
 
   getSessions(): AcpSessionInfo[] {
     return Array.from(this.sessions.values());
+  }
+
+  /**
+   * Snapshot the recent-prompts ring buffer (newest last). Returns a
+   * shallow copy — callers can iterate freely without holding back
+   * eviction.
+   */
+  getRecentPrompts(): AcpPromptRecord[] {
+    // Defensive copy of each record; prompt records are mutated in
+    // place while a turn streams, and we don't want callers reading
+    // half-updated objects across awaits.
+    return this.recentPrompts.map((r) => ({ ...r }));
+  }
+
+  /**
+   * Append a record to the ring buffer, dropping the oldest entry if
+   * the buffer is full. Mutating the returned reference later (to
+   * append response chunks, set status, etc.) is intentional and safe
+   * because {@link getRecentPrompts} returns shallow copies.
+   */
+  private appendPromptRecord(record: AcpPromptRecord): void {
+    this.recentPrompts.push(record);
+    while (this.recentPrompts.length > MAX_RECENT_PROMPTS_PER_WORKER) {
+      this.recentPrompts.shift();
+    }
   }
 
   /**
@@ -256,6 +386,10 @@ export class AcpWorker {
 
       this._state = 'ready';
       this.resetIdleTimer();
+      // Start the background keepalive *after* the worker reaches
+      // ready state so we never ping a half-initialized CLI.
+      this.keepaliveIntervalMs = Math.max(0, settings.keepaliveIntervalMs ?? 0);
+      this.startKeepalive();
       logger.info(`[ACP] Worker started for credential ${this.credentialId}`);
     } catch (err) {
       this._state = 'error';
@@ -350,14 +484,87 @@ export class AcpWorker {
     this.touchActivity();
     session.lastActivity = Date.now();
 
+    // Open a fresh record in the recent-prompts ring buffer. The
+    // record is mutated as chunks stream in and finalized in the
+    // resolve/reject branches below. Tracking lives entirely inside
+    // this method so the public API surface is unchanged.
+    const { summary: promptSummary, charCount: promptCharCount } =
+      summarizePromptContent(contentBlocks);
+    const promptRecord: AcpPromptRecord = {
+      id: `p${this.nextPromptSeq++}`,
+      acpSessionId: sessionId,
+      startedAt: Date.now(),
+      status: 'in_progress',
+      promptSummary,
+      promptCharCount,
+      responseSummary: '',
+      responseCharCount: 0,
+    };
+    this.appendPromptRecord(promptRecord);
+
+    // Wrap the caller's onUpdate so we can intercept chunks/usage for
+    // the ring buffer without changing observable behavior. Errors in
+    // this wrapper must NEVER propagate — accounting bugs should not
+    // break the live stream the request handler depends on.
+    const trackedOnUpdate = (update: SessionNotification): void => {
+      try {
+        const u = update.update;
+        if (
+          u.sessionUpdate === 'agent_message_chunk' &&
+          u.content.type === 'text' &&
+          typeof u.content.text === 'string'
+        ) {
+          const chunk = u.content.text;
+          promptRecord.responseCharCount += chunk.length;
+          if (promptRecord.responseSummary.length < PROMPT_SUMMARY_CAP) {
+            const remaining =
+              PROMPT_SUMMARY_CAP - promptRecord.responseSummary.length;
+            promptRecord.responseSummary += chunk.slice(0, remaining);
+          }
+        }
+      } catch {
+        // Diagnostics must not break the prompt stream.
+      }
+      onUpdate(update);
+    };
+
+    const finalize = (
+      status: AcpPromptStatus,
+      opts?: {
+        usage?: acp.PromptResponse['usage'];
+        errorMessage?: string;
+      },
+    ): void => {
+      promptRecord.status = status;
+      promptRecord.finishedAt = Date.now();
+      promptRecord.durationMs =
+        promptRecord.finishedAt - promptRecord.startedAt;
+      if (opts?.errorMessage !== undefined) {
+        promptRecord.errorMessage = opts.errorMessage;
+      }
+      const usage = opts?.usage ?? null;
+      if (usage) {
+        promptRecord.inputTokens = usage.inputTokens;
+        promptRecord.outputTokens = usage.outputTokens;
+        promptRecord.totalTokens = usage.totalTokens;
+        if (usage.cachedReadTokens != null) {
+          promptRecord.cachedTokens = usage.cachedReadTokens;
+        }
+        if (usage.thoughtTokens != null) {
+          promptRecord.thoughtTokens = usage.thoughtTokens;
+        }
+      }
+    };
+
     return new Promise<acp.PromptResponse>((resolve, reject) => {
       this.promptListeners.set(sessionId, {
-        onUpdate,
+        onUpdate: trackedOnUpdate,
         onDone: () => {
           // Will be resolved by the prompt() return
         },
         onError: (err: Error) => {
           this.promptListeners.delete(sessionId);
+          finalize('error', { errorMessage: err.message });
           reject(err);
         },
       });
@@ -366,15 +573,26 @@ export class AcpWorker {
         sessionId,
         prompt: contentBlocks,
       })
-        .then((response) => {
+        .then((response: acp.PromptResponse) => {
           this.promptListeners.delete(sessionId);
           this.touchActivity();
+          // ACP signals user-initiated cancellation via stopReason
+          // rather than rejection; surface it as a distinct status so
+          // the admin UI can show it differently from outright errors.
+          const status: AcpPromptStatus =
+            response.stopReason === 'cancelled' ? 'cancelled' : 'completed';
+          // Pull usage into a local first so ts-eslint's stricter
+          // unsafe-assignment rule sees a typed binding instead of
+          // a property access on the (loosely typed) PromptResponse.
+          const usage: acp.PromptResponse['usage'] = response.usage;
+          finalize(status, { usage });
           resolve(response);
         })
         .catch((err: unknown) => {
           this.promptListeners.delete(sessionId);
           let msg: string;
           if (err instanceof Error) {
+            finalize('error', { errorMessage: err.message });
             reject(err);
             return;
           }
@@ -387,6 +605,7 @@ export class AcpWorker {
               msg = String(err);
             }
           }
+          finalize('error', { errorMessage: msg });
           reject(new Error(msg));
         });
     });
@@ -468,6 +687,7 @@ export class AcpWorker {
   async shutdown(): Promise<void> {
     this._state = 'dead';
     this.clearIdleTimer();
+    this.stopKeepalive();
 
     // Reject pending prompts
     for (const [, listener] of this.promptListeners) {
@@ -515,6 +735,62 @@ export class AcpWorker {
     if (this.idleTimer) {
       clearTimeout(this.idleTimer);
       this.idleTimer = undefined;
+    }
+  }
+
+  /**
+   * Begin periodic keepalive pings. The CLI subprocess re-runs the
+   * stored OAuth flow on each call, which is enough to: (a) refresh
+   * an expired access_token via the refresh_token, and (b) keep the
+   * gRPC channel to Google warm so the next user-facing request
+   * doesn't pay a fresh TLS+HTTP/2 handshake. No-op if the interval
+   * is 0 ("disabled") or the worker is not ready.
+   */
+  private startKeepalive(): void {
+    this.stopKeepalive();
+    if (this.keepaliveIntervalMs <= 0) return;
+    if (this._state !== 'ready') return;
+    this.keepaliveTimer = setInterval(() => {
+      void this.runKeepalive();
+    }, this.keepaliveIntervalMs);
+  }
+
+  private stopKeepalive(): void {
+    if (this.keepaliveTimer) {
+      clearInterval(this.keepaliveTimer);
+      this.keepaliveTimer = undefined;
+    }
+  }
+
+  /**
+   * Skip the ping if the worker has had real traffic recently —
+   * touching the connection is pointless if a user request just
+   * exercised it. {@link AcpPoolSettings.keepaliveIntervalMs} is
+   * also our staleness threshold here.
+   */
+  private async runKeepalive(): Promise<void> {
+    if (this._state !== 'ready' || !this.connection) return;
+    const idleFor = Date.now() - this._lastActivity;
+    if (idleFor < this.keepaliveIntervalMs) return;
+    // Don't pile a keepalive on top of an in-flight prompt — the
+    // CLI doesn't multiplex, and we'd block both calls.
+    if (this.promptListeners.size > 0) return;
+    try {
+      await this.connection.authenticate({ methodId: 'oauth-personal' });
+      // Don't call touchActivity() here — keepalives shouldn't push
+      // back the idle timeout. The whole point is to refresh the
+      // connection without making the worker look "active" to the
+      // pool's eviction logic.
+      logger.debug(
+        `[ACP] Keepalive refreshed credential ${this.credentialId} (idle ${Math.floor(idleFor / 1000)}s)`,
+      );
+    } catch (err) {
+      // Log but don't kill the worker — a single failed keepalive
+      // doesn't mean the worker is dead, and the next user request
+      // will surface a real error if the connection is truly gone.
+      logger.warn(
+        `[ACP] Keepalive failed for ${this.credentialId}: ${err instanceof Error ? err.message : String(err)}`,
+      );
     }
   }
 }
@@ -669,6 +945,17 @@ export class AcpProcessPool {
       sessions.push(...worker.getSessions());
     }
     return sessions;
+  }
+
+  /**
+   * Get the recent-prompts ring buffer for a specific worker. Returns
+   * an empty array if the worker doesn't exist (callers don't need to
+   * distinguish "no worker" from "no recent prompts" — both render
+   * identically in the UI).
+   */
+  getRecentPrompts(credentialId: string): AcpPromptRecord[] {
+    const worker = this.workers.get(credentialId);
+    return worker ? worker.getRecentPrompts() : [];
   }
 
   /**

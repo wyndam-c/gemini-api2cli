@@ -250,6 +250,13 @@ type PromptApiSettings = {
   acpIdleTimeoutMs: number;
   maxWorkers: number;
   failoverWorkers: number;
+  /**
+   * ACP worker keepalive interval in ms. After this many ms of
+   * inactivity, the pool re-runs `oauth-personal` auth on the worker
+   * to refresh tokens and exercise the gRPC channel before they get
+   * idle-closed. 0 disables. See {@link AcpPoolSettings.keepaliveIntervalMs}.
+   */
+  acpKeepaliveIntervalMs: number;
 };
 
 type PromptApiState = {
@@ -480,6 +487,12 @@ function createPromptApiState(
       acpIdleTimeoutMs: 0,
       maxWorkers: 2,
       failoverWorkers: 1,
+      // Default: 9 minutes. Comfortably under the typical 10-15 min
+      // HTTP/2 idle close used by Google's frontends and the 1-hour
+      // OAuth access_token TTL — so the first user request after a
+      // long lull doesn't pay a TLS+token-refresh round trip.
+      // Operators can set 0 to disable.
+      acpKeepaliveIntervalMs: 9 * 60_000,
     },
     acpPool,
     rotationIndex: 0,
@@ -1517,6 +1530,7 @@ async function getAcpWorkerAndSession(
       proxyUrl: state.settings.proxyUrl,
       maxWorkers: state.settings.maxWorkers,
       failoverWorkers: state.settings.failoverWorkers,
+      keepaliveIntervalMs: state.settings.acpKeepaliveIntervalMs,
     },
   );
 
@@ -1596,6 +1610,7 @@ async function getAcpWorkerAndSessionExcluding(
         proxyUrl: state.settings.proxyUrl,
         maxWorkers: state.settings.maxWorkers,
         failoverWorkers: state.settings.failoverWorkers,
+        keepaliveIntervalMs: state.settings.acpKeepaliveIntervalMs,
       });
       const sessionId = await worker.createSession();
       return { worker, sessionId, credentialId: cred.id };
@@ -2310,6 +2325,7 @@ export function createPromptApiRouter(
         proxyUrl: state.settings.proxyUrl,
         maxWorkers: state.settings.maxWorkers,
         failoverWorkers: state.settings.failoverWorkers,
+        keepaliveIntervalMs: state.settings.acpKeepaliveIntervalMs,
       };
 
       // Warm up primary worker
@@ -2498,6 +2514,20 @@ export function createPromptApiRouter(
         }
         state.settings.failoverWorkers = Math.floor(n);
       }
+      if (b['acpKeepaliveIntervalMs'] !== undefined) {
+        const n = Number(b['acpKeepaliveIntervalMs']);
+        if (!Number.isFinite(n) || n < 0) {
+          throw new BadRequestError(
+            '"acpKeepaliveIntervalMs" must be a non-negative number (0 = disabled).',
+          );
+        }
+        // Note: this updates the setting in-place but already-running
+        // workers keep the previous interval baked in. The next
+        // worker spawn (after a kill, idle timeout, or pool churn)
+        // will pick up the new value. Operators who need it applied
+        // immediately can hit "Kill All Workers" in the admin console.
+        state.settings.acpKeepaliveIntervalMs = Math.floor(n);
+      }
       return res
         .status(200)
         .json({ settings: state.settings, defaultTimeoutMs: deps.timeoutMs });
@@ -2524,6 +2554,23 @@ export function createPromptApiRouter(
       sessions: state.acpPool.getAllSessions(),
     }),
   );
+
+  // Recent prompt-turn records for one worker. Powers the admin
+  // console's expandable per-worker detail panel — shows the last N
+  // prompts with truncated content summaries and token usage so the
+  // operator can spot misuse, quota anomalies, or stuck turns without
+  // tailing logs. Records live only in worker memory and are evicted
+  // when the worker shuts down.
+  router.get('/v1/acp/workers/:credentialId/recent', (req, res) => {
+    const credentialId = req.params['credentialId'];
+    if (typeof credentialId !== 'string' || !credentialId) {
+      return res.status(400).json({ error: 'Invalid credential ID' });
+    }
+    return res.status(200).json({
+      credentialId,
+      prompts: state.acpPool.getRecentPrompts(credentialId),
+    });
+  });
 
   // --- Logs panel endpoints ----------------------------------------------
   // Historical snapshot (filters applied server-side so the client only
