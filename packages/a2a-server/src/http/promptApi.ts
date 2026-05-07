@@ -3008,6 +3008,11 @@ export function createPromptApiRouter(
     // the post-prompt stderr so it sees only what *this* test
     // generated (avoids false positives from prior turns).
     let stderrAtStart = '';
+    // Set by the post-mortem path to claim ownership of session
+    // cleanup. When true, the finally block will NOT destroy the
+    // session — the post-mortem will do it after the CLI naturally
+    // settles, so we don't race the CLI's state machine.
+    let postMortemOwnsCleanup = false;
 
     try {
       worker = await state.acpPool.getOrCreate(credentialId, homeDir, {
@@ -3070,45 +3075,48 @@ export function createPromptApiRouter(
       });
     } catch (err) {
       const durationMs = Date.now() - startTime;
-      // Best-effort cancel — the prompt may still be in flight
-      // inside the CLI subprocess. Race a short timeout so a
-      // wedged cancel doesn't itself become the bottleneck.
-      if (worker && sessionId) {
-        try {
-          await Promise.race([
-            worker.cancelPrompt(sessionId),
-            new Promise<void>((resolve) => setTimeout(resolve, 3_000)),
-          ]);
-        } catch {
-          /* best-effort cleanup */
-        }
-      }
-
       // ── Post-mortem: capture the real failure reason ──
-      // The CLI subprocess swallows API errors in two distinct ways:
       //
-      //   A. Reject prompt() with a stringified error — the easy
-      //      case, we just parse it.
-      //   B. Resolve prompt() with stopReason and an EMPTY reply
-      //      (Reply length=0). This happens when the CLI's
-      //      internal 429 retry "gives up gracefully" — looks like
-      //      success from our side but no content was actually
-      //      generated. The real Google error only ever surfaced
-      //      in stderr.
+      // We deliberately DO NOT call cancelPrompt here. Cancelling
+      // the CLI cleanly returns stopReason=cancelled with empty
+      // stderr — i.e., we throw away the diagnostic information
+      // we actually need to detect the 429 / RESOURCE_EXHAUSTED
+      // condition. So instead we let the CLI keep running in the
+      // background; eventually it'll either:
       //
-      // For case B we have to scrape the stderr tail buffer, which
-      // we snapshotted before the prompt started so we don't pick
-      // up unrelated errors from prior turns.
+      //   A. Reject prompt() with a stringified error → we parse it.
+      //   B. Resolve prompt() with empty reply but stderr now full
+      //      of the real Google error → we scrape stderr for the
+      //      RESOURCE_EXHAUSTED details and quotaResetTimeStamp.
+      //   C. Eventually succeed (CLI's internal retry recovered) →
+      //      log "credential is healthy; cooldown not applied".
       //
-      // For both cases, if we find evidence of 429 / quota
-      // exhaustion we call applyCredentialCooldown so the cred
-      // card gets its ⏰ countdown chip, even if the user already
-      // saw a generic "unhealthy" message.
-      if (promptPromise && worker) {
+      // The destroySession call is moved to the post-mortem too,
+      // so it runs only after the CLI naturally settles. Otherwise
+      // destroying mid-flight would race with the CLI's own state
+      // machine and could cause spurious errors on the next turn.
+      //
+      // Risk: if every test fails, we accumulate background prompts
+      // up to maxWorkers × <CLI internal retry budget>. Acceptable —
+      // operator triggered manually and CLI gives up in <60 s.
+      if (promptPromise && worker && sessionId) {
+        postMortemOwnsCleanup = true;
         const credIdSnapshot = credentialId;
         const modelSnapshot = requestModel;
         const workerSnapshot: AcpWorker = worker;
+        const sidSnapshot = sessionId;
         const stderrAnchor = stderrAtStart;
+        // Cleanup helper — runs after the prompt has actually
+        // settled, so we never destroy a session out from under
+        // an in-flight CLI request.
+        const tearDown = (): void => {
+          try {
+            workerSnapshot.destroySession(sidSnapshot);
+          } catch {
+            /* destroySession is best-effort; if the session is
+               already gone we don't care. */
+          }
+        };
         void promptPromise.then(
           (replyText) => {
             // Slice off any stderr that was already buffered
@@ -3129,6 +3137,7 @@ export function createPromptApiRouter(
               logger.info(
                 `[ACP] Test post-mortem: credential ${credIdSnapshot} eventually succeeded (CLI internal retry recovered after our ${TEST_TIMEOUT_MS / 1000}s timeout). Reply length=${replyText.length}, stopReason=${stopReason}. Credential is healthy; cooldown not applied.`,
               );
+              tearDown();
               return;
             }
 
@@ -3189,6 +3198,7 @@ export function createPromptApiRouter(
                 synthErr,
               );
             }
+            tearDown();
           },
           (postErr: unknown) => {
             const postMsg = extractErrorMessage(postErr);
@@ -3203,9 +3213,14 @@ export function createPromptApiRouter(
                 postErr,
               );
             }
+            tearDown();
           },
         );
       }
+      // If promptPromise was never created (getOrCreate or
+      // createSession threw before we issued the prompt), the
+      // outer finally handles destroySession because
+      // postMortemOwnsCleanup stayed false.
 
       // Return 200 with ok:false so the admin console frontend
       // surfaces the error as a credential-level fault, not a
@@ -3223,7 +3238,13 @@ export function createPromptApiRouter(
         postMortemPending: true,
       });
     } finally {
-      if (worker && sessionId) {
+      // The post-mortem path takes ownership of cleanup so the CLI
+      // can finish its in-flight retry naturally — destroying the
+      // session mid-flight would race the CLI's own state machine
+      // and could lose the stderr we need to extract 429 info.
+      // The success path (and the "couldn't even start" branch)
+      // both fall through here and clean up immediately.
+      if (worker && sessionId && !postMortemOwnsCleanup) {
         try {
           worker.destroySession(sessionId);
         } catch {
