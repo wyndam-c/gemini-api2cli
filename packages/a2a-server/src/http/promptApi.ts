@@ -1470,7 +1470,7 @@ async function getEffectiveCredentialIdAndHome(
         const idx = state.rotationIndex % credentials.length;
         state.rotationIndex = idx + 1;
         const credential = credentials[idx];
-        if (state.credentialCooldowns.has(credential.id)) {
+        if (hasCredentialWideCooldown(state, credential.id)) {
           logger.info(
             `[Prompt API] Rotation: skipping cooled-down credential "${credential.label}" (${credential.id})`,
           );
@@ -1557,13 +1557,244 @@ function promptToContentBlocks(
   return blocks;
 }
 
+// Default cooldown for "Resource has been exhausted (e.g. check quota)"
+// errors where Google didn't include a precise quotaResetTimeStamp.
+// 4 hours mirrors gcli2api's RESOURCE_EXHAUSTED_COOLDOWN_HOURS — long
+// enough to dodge a hot rate limit, short enough that a transient
+// upstream blip doesn't lock a credential out for the whole day.
+const RESOURCE_EXHAUSTED_FALLBACK_MS = 4 * 60 * 60_000;
+
+/**
+ * Cooldown key. We track at credential + model granularity rather
+ * than per-credential because Gemini quotas are per-model — exhausting
+ * gemini-2.5-pro on a credential doesn't affect gemini-2.5-flash on
+ * the same credential. A `*` model is used for credential-wide
+ * cooldowns (auth failures, generic errors).
+ */
+function cooldownKey(credentialId: string, model: string): string {
+  return credentialId + '\x1f' + model; // unit-separator, won't appear in IDs
+}
+
+/**
+ * Treat any cooldown whose stored expiry has passed as gone.
+ * Returns true iff the credential+model is still cooled down.
+ *
+ * Currently used only by tests / external callers — the in-handler
+ * paths skip on hasCredentialWideCooldown (when model is unknown)
+ * and rely on the failover loop to re-trigger applyCredentialCooldown
+ * for per-model rejections that slipped through. Exported so TS
+ * doesn't strip it as unused.
+ */
+export function isCooledDown(
+  state: PromptApiState,
+  credentialId: string,
+  model: string,
+): boolean {
+  const now = Date.now();
+  // Per-model cooldown takes precedence — a model-specific quota
+  // exhaustion shouldn't block other models on the same credential.
+  const k = cooldownKey(credentialId, model);
+  const exp = state.credentialCooldowns.get(k);
+  if (typeof exp === 'number') {
+    if (exp > now) return true;
+    state.credentialCooldowns.delete(k);
+  }
+  // Credential-wide cooldown (auth errors, etc.) blocks every model.
+  const wide = state.credentialCooldowns.get(cooldownKey(credentialId, '*'));
+  if (typeof wide === 'number') {
+    if (wide > now) return true;
+    state.credentialCooldowns.delete(cooldownKey(credentialId, '*'));
+  }
+  return false;
+}
+
+/**
+ * Used by rotation when we don't yet know which model the upcoming
+ * request will use. We only treat *credential-wide* cooldowns as
+ * disqualifying — a model-specific cooldown leaves other models on
+ * the same credential still usable, so we let those through and let
+ * the per-model check at the call site reject if needed.
+ */
+function hasCredentialWideCooldown(
+  state: PromptApiState,
+  credentialId: string,
+): boolean {
+  const now = Date.now();
+  const wide = state.credentialCooldowns.get(cooldownKey(credentialId, '*'));
+  if (typeof wide !== 'number') return false;
+  if (wide > now) return true;
+  state.credentialCooldowns.delete(cooldownKey(credentialId, '*'));
+  return false;
+}
+
 function pruneCredentialCooldowns(state: PromptApiState): void {
   const now = Date.now();
-  for (const [id, ts] of state.credentialCooldowns) {
-    if (now - ts > CREDENTIAL_COOLDOWN_MS) {
-      state.credentialCooldowns.delete(id);
+  for (const [k, exp] of state.credentialCooldowns) {
+    if (typeof exp === 'number' && exp <= now) {
+      state.credentialCooldowns.delete(k);
     }
   }
+}
+
+/**
+ * Try to extract Google's `quotaResetTimeStamp` from a failure
+ * response. The CLI subprocess relays Gemini errors as a stringified
+ * JSON message, so we have to peel a couple of layers — first parse
+ * the JSON, then walk the (well-defined) error.details array looking
+ * for the ErrorInfo block.
+ *
+ * Reference shape:
+ *   {
+ *     "error": {
+ *       "code": 429,
+ *       "status": "RESOURCE_EXHAUSTED",
+ *       "details": [
+ *         {
+ *           "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+ *           "reason": "QUOTA_EXHAUSTED",
+ *           "metadata": { "quotaResetTimeStamp": "2026-05-08T14:57:24Z" }
+ *         }
+ *       ]
+ *     }
+ *   }
+ */
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return v !== null && typeof v === 'object' && !Array.isArray(v);
+}
+
+function parseQuotaResetMs(errorMsg: string): number | undefined {
+  // Find the first `{` and try parsing from there — message often has
+  // a prefix like "Error from CLI: {...json...}".
+  const start = errorMsg.indexOf('{');
+  if (start < 0) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(errorMsg.slice(start));
+  } catch {
+    return undefined;
+  }
+  if (!isRecord(parsed)) return undefined;
+
+  // Google's shape is well-defined: { "error": { code, status, ...,
+  // details: [...] } }. The CLI sometimes drops the wrapping `error`
+  // key, so accept either top-level form.
+  const innerError = parsed['error'];
+  let err: Record<string, unknown>;
+  if (isRecord(innerError)) {
+    err = innerError;
+  } else {
+    const codeVal = parsed['code'];
+    const statusVal = parsed['status'];
+    if (typeof codeVal !== 'number' && typeof statusVal !== 'string') {
+      return undefined;
+    }
+    err = parsed;
+  }
+
+  const details = err['details'];
+  if (!Array.isArray(details)) {
+    // Fallback: status + message pattern → 4 h cooldown (gcli2api parity).
+    const statusVal = err['status'];
+    const codeVal = err['code'];
+    const messageVal = err['message'];
+    const isResourceExhausted =
+      statusVal === 'RESOURCE_EXHAUSTED' ||
+      codeVal === 429 ||
+      (typeof messageVal === 'string' &&
+        messageVal.toLowerCase().includes('resource has been exhausted'));
+    if (isResourceExhausted) {
+      return Date.now() + RESOURCE_EXHAUSTED_FALLBACK_MS;
+    }
+    return undefined;
+  }
+
+  for (const detail of details) {
+    if (!isRecord(detail)) continue;
+    const detailType = detail['@type'];
+    if (detailType !== 'type.googleapis.com/google.rpc.ErrorInfo') continue;
+    const md = detail['metadata'];
+    if (!isRecord(md)) continue;
+    const ts = md['quotaResetTimeStamp'];
+    if (typeof ts !== 'string') continue;
+    const parsedTs = Date.parse(ts);
+    if (Number.isFinite(parsedTs)) return parsedTs;
+  }
+  return undefined;
+}
+
+/**
+ * Mark a credential (optionally for a specific model) as in cooldown.
+ * The cooldown duration is computed in priority order:
+ *   1. Google's `quotaResetTimeStamp` if present in the error body
+ *      (Gemini tells us *exactly* when the quota window flips —
+ *      respecting it means we can re-use the credential the moment
+ *      Google itself starts accepting calls again).
+ *   2. RESOURCE_EXHAUSTED fallback (4 h) if the error matches the
+ *      pattern but no precise timestamp came back.
+ *   3. CREDENTIAL_COOLDOWN_MS for generic retryable errors.
+ */
+function applyCredentialCooldown(
+  state: PromptApiState,
+  credentialId: string,
+  model: string,
+  err: unknown,
+): void {
+  const msg = extractErrorMessage(err);
+  const lowerMsg = msg.toLowerCase();
+
+  // Status-code-based decisions, mirroring gcli2api's
+  // _is_permanent_refresh_failure: 400 / 401 / 403 mean the credential
+  // is genuinely broken and should be cooled down credential-wide
+  // (block every model, not just the one we just failed on) — at the
+  // RESOURCE_EXHAUSTED fallback duration so admins have time to spot
+  // it. 5xx are upstream Google issues; do NOT cool the credential.
+  if (
+    /\b40[01]\b/.test(msg) ||
+    /\b403\b/.test(msg) ||
+    lowerMsg.includes('invalid_grant') ||
+    lowerMsg.includes('invalid_refresh_token') ||
+    lowerMsg.includes('refresh_token_expired')
+  ) {
+    state.credentialCooldowns.set(
+      cooldownKey(credentialId, '*'),
+      Date.now() + RESOURCE_EXHAUSTED_FALLBACK_MS,
+    );
+    logger.warn(
+      `[ACP] Credential ${credentialId} marked unhealthy (auth/permanent error): ${msg.slice(0, 200)}`,
+    );
+    return;
+  }
+  if (
+    /\b50[0234]\b/.test(msg) ||
+    lowerMsg.includes('upstream') ||
+    lowerMsg.includes('temporarily unavailable')
+  ) {
+    logger.info(
+      `[ACP] Credential ${credentialId} hit upstream error, NOT cooling down: ${msg.slice(0, 120)}`,
+    );
+    return;
+  }
+
+  // Quota / 429 path — try precise timestamp first, fall back to
+  // the gcli2api-style 4 h window, finally the original 60 s.
+  const resetMs = parseQuotaResetMs(msg);
+  if (typeof resetMs === 'number' && resetMs > Date.now()) {
+    state.credentialCooldowns.set(cooldownKey(credentialId, model), resetMs);
+    const seconds = Math.ceil((resetMs - Date.now()) / 1000);
+    logger.info(
+      `[ACP] Credential ${credentialId} model ${model} cooled down until ${new Date(resetMs).toISOString()} (~${seconds}s, from quotaResetTimeStamp)`,
+    );
+    return;
+  }
+
+  // Generic retry — short cooldown, only on this credential+model.
+  state.credentialCooldowns.set(
+    cooldownKey(credentialId, model),
+    Date.now() + CREDENTIAL_COOLDOWN_MS,
+  );
+  logger.info(
+    `[ACP] Credential ${credentialId} model ${model} cooled down for ${CREDENTIAL_COOLDOWN_MS / 1000}s (generic retry)`,
+  );
 }
 
 /**
@@ -1600,7 +1831,7 @@ async function getAcpWorkerAndSessionExcluding(
   const credentials = await state.credentialStore.listCredentials();
   for (const cred of credentials) {
     if (excludeCredentialIds.has(cred.id)) continue;
-    if (state.credentialCooldowns.has(cred.id)) continue;
+    if (hasCredentialWideCooldown(state, cred.id)) continue;
     const homeDir = state.credentialStore.getCredentialHomeDir(cred.id);
     try {
       const worker = await state.acpPool.getOrCreate(cred.id, homeDir, {
@@ -1678,7 +1909,7 @@ async function speculativeWorkerAndSession(
   const credentials = await state.credentialStore.listCredentials();
   for (const cred of credentials) {
     if (excludeCredentialIds.has(cred.id)) continue;
-    if (state.credentialCooldowns.has(cred.id)) continue;
+    if (hasCredentialWideCooldown(state, cred.id)) continue;
     const worker = state.acpPool.getReadyWorker(cred.id);
     if (!worker) continue;
     try {
@@ -1771,7 +2002,7 @@ function acceptPrefetched(
   //   - The worker died between prefetch success and consumption.
   const stale =
     triedCredentials.has(credId) ||
-    state.credentialCooldowns.has(credId) ||
+    hasCredentialWideCooldown(state, credId) ||
     prefetched.worker.state !== 'ready';
   if (stale) {
     try {
@@ -1929,13 +2160,14 @@ async function handleAcpJsonRequest(
           `[ACP] Prompt error (attempt ${attempt + 1}/${maxAttempts}): ${lastError}`,
         );
 
-        // Mark credential as unhealthy and failover on credential/quota errors
-        if (isCredentialFailoverError(err)) {
-          state.credentialCooldowns.set(worker.credentialId, Date.now());
-          logger.info(
-            `[ACP] Credential ${worker.credentialId} cooled down for ${CREDENTIAL_COOLDOWN_MS / 1000}s`,
-          );
-        }
+        // Mark the credential as unhealthy. applyCredentialCooldown
+        // picks the right cooldown duration:
+        //   - Google's quotaResetTimeStamp when present (precise)
+        //   - 4 h on RESOURCE_EXHAUSTED without timestamp
+        //   - 60 s otherwise
+        // and chooses per-model vs credential-wide based on whether
+        // the error is auth (4xx) or quota (429).
+        applyCredentialCooldown(state, worker.credentialId, model, err);
         if (!isCredentialFailoverError(err) || attempt + 1 >= maxAttempts) {
           return res
             .status(500)
@@ -1964,6 +2196,51 @@ async function handleAcpJsonRequest(
   }
 }
 
+// Streaming heartbeat — defeats Cloudflare's 100s edge timeout
+// (and other intermediary idle timeouts) on long generations.
+// We periodically write an SSE comment line. Comments are spec-defined
+// to be ignored by EventSource and OpenAI/Gemini SSE clients, so they
+// don't interfere with the actual content stream — they exist only to
+// keep bytes flowing through the proxy chain.
+//
+// 30 s gives a comfortable margin under Cloudflare's 100 s ceiling
+// without flooding clients with no-op writes. Reset on every real
+// chunk so we never collide with content writes.
+const STREAM_HEARTBEAT_MS = 30_000;
+const SSE_HEARTBEAT_BYTES = ': keepalive\n\n';
+
+/**
+ * Wrap a Node response with a self-rescheduling heartbeat. Returns a
+ * cleanup function the caller MUST run on every exit path (success,
+ * error, abort) to avoid orphaned timers writing to a closed socket.
+ */
+function startStreamHeartbeat(res: Response): () => void {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const fire = (): void => {
+    if (res.writableEnded || res.destroyed) return;
+    try {
+      res.write(SSE_HEARTBEAT_BYTES);
+    } catch {
+      // Socket may have closed between the writableEnded check and
+      // the write — silently swallow; the next caller op will see
+      // the closed state and finalize cleanup.
+      return;
+    }
+    schedule();
+  };
+  const schedule = (): void => {
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(fire, STREAM_HEARTBEAT_MS);
+  };
+  schedule();
+  return () => {
+    if (timer) {
+      clearTimeout(timer);
+      timer = undefined;
+    }
+  };
+}
+
 async function handleAcpStreamingRequest(
   req: Request,
   res: Response,
@@ -1985,6 +2262,9 @@ async function handleAcpStreamingRequest(
   const triedCredentials = new Set<string>();
   let lastError = '';
   let headersSent = false;
+  // Set when the first heartbeat-eligible response is committed.
+  // Cleared by stopHeartbeat() before res.end() on every exit path.
+  let stopHeartbeat: (() => void) | undefined;
 
   // Prefetch slot for failover — see handleAcpJsonRequest for details.
   const prefetchRef: PrefetchRef = { current: null };
@@ -2059,6 +2339,11 @@ async function handleAcpStreamingRequest(
         res.setHeader('X-Accel-Buffering', 'no');
         res.flushHeaders();
         headersSent = true;
+        // Start the heartbeat as soon as the response is committed.
+        // From Cloudflare's perspective, bytes are flowing → no 524.
+        // The heartbeat self-reschedules; stopHeartbeat() cancels it
+        // and is called on every exit path below.
+        stopHeartbeat = startStreamHeartbeat(res);
       }
 
       let isFirst = true;
@@ -2101,6 +2386,7 @@ async function handleAcpStreamingRequest(
         req.off('aborted', abortHandler);
         res.off('close', abortHandler);
         worker.destroySession(sessionId);
+        if (stopHeartbeat) stopHeartbeat();
         res.end();
         return;
       } catch (err) {
@@ -2113,19 +2399,19 @@ async function handleAcpStreamingRequest(
           `[ACP] Prompt error (stream, attempt ${attempt + 1}/${maxAttempts}): ${lastError}`,
         );
 
-        // Mark credential as unhealthy on failover-eligible errors
-        if (isCredentialFailoverError(err)) {
-          state.credentialCooldowns.set(worker.credentialId, Date.now());
-          logger.info(
-            `[ACP] Credential ${worker.credentialId} cooled down for ${CREDENTIAL_COOLDOWN_MS / 1000}s`,
-          );
-        }
+        // Mark credential as unhealthy on failover-eligible errors.
+        // The cooldown duration comes from Google's own
+        // quotaResetTimeStamp when present (precise per-quota recovery
+        // window) and falls back to a fixed CREDENTIAL_COOLDOWN_MS for
+        // generic retryable errors.
+        applyCredentialCooldown(state, worker.credentialId, model, err);
 
         // Can only failover if no chunks were sent yet
         if (!isFirst || cancelled || !isCredentialFailoverError(err)) {
           if (!cancelled) {
             res.write(adapter.formatStreamError(lastError, model, requestId));
           }
+          if (stopHeartbeat) stopHeartbeat();
           res.end();
           return;
         }
@@ -2145,10 +2431,15 @@ async function handleAcpStreamingRequest(
         requestId,
       ),
     );
+    if (stopHeartbeat) stopHeartbeat();
     res.end();
   } finally {
     // Clean up any unused prefetched session (happy path or early break).
     discardPrefetch(prefetchRef);
+    // Belt-and-suspenders: if any code path forgot to stop the
+    // heartbeat, do it here so we don't leak timers writing to a
+    // closed socket.
+    if (stopHeartbeat) stopHeartbeat();
   }
 }
 
