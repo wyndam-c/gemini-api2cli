@@ -2999,6 +2999,15 @@ export function createPromptApiRouter(
     // continue awaiting it in the background after a user-facing
     // timeout — see "post-mortem" comment below.
     let promptPromise: Promise<string> | undefined;
+    // Captured by the prompt() callback. Used by the post-mortem to
+    // distinguish "real success with content" from "empty success
+    // because CLI swallowed an upstream 429".
+    let stopReason: string | undefined;
+    // Snapshot of the worker's stderr-tail buffer right before
+    // we issue the prompt. The post-mortem subtracts this from
+    // the post-prompt stderr so it sees only what *this* test
+    // generated (avoids false positives from prior turns).
+    let stderrAtStart = '';
 
     try {
       worker = await state.acpPool.getOrCreate(credentialId, homeDir, {
@@ -3014,6 +3023,7 @@ export function createPromptApiRouter(
       sessionId = await worker.createSession();
 
       let reply = '';
+      stderrAtStart = worker.getStderrTail();
       // Closure-capture the locals we need inside the race promise so
       // TypeScript's narrowing doesn't lose them across the await.
       const w = worker;
@@ -3033,7 +3043,10 @@ export function createPromptApiRouter(
             }
           },
         )
-        .then(() => reply);
+        .then((response) => {
+          stopReason = response.stopReason;
+          return reply;
+        });
 
       const timeoutPromise = new Promise<never>((_, reject) => {
         setTimeout(
@@ -3072,33 +3085,110 @@ export function createPromptApiRouter(
       }
 
       // ── Post-mortem: capture the real failure reason ──
-      // The CLI subprocess retries 429s internally for ~30s, longer
-      // than our 15s test timeout. When we time out, we don't yet
-      // know whether the credential is genuinely broken or just
-      // momentarily slow. So we let the underlying prompt promise
-      // continue running in the background and update cooldown /
-      // log whatever it eventually returns:
-      //   - rejects with 429 / RESOURCE_EXHAUSTED → record exact
-      //     cooldown via applyCredentialCooldown so the next
-      //     refresh of /v1/credentials shows the precise countdown
-      //     chip on the card.
-      //   - rejects with auth error → credential-wide cooldown,
-      //     so the admin console flags it for re-login.
-      //   - resolves successfully → log a warning that we
-      //     erroneously timed out a healthy credential (which is
-      //     actually useful diagnostic info — it means CLI's
-      //     internal retry succeeded and the credential is fine
-      //     after all).
-      // Promise is detached (void) — the response has already been
-      // sent so we don't await it.
-      if (promptPromise) {
+      // The CLI subprocess swallows API errors in two distinct ways:
+      //
+      //   A. Reject prompt() with a stringified error — the easy
+      //      case, we just parse it.
+      //   B. Resolve prompt() with stopReason and an EMPTY reply
+      //      (Reply length=0). This happens when the CLI's
+      //      internal 429 retry "gives up gracefully" — looks like
+      //      success from our side but no content was actually
+      //      generated. The real Google error only ever surfaced
+      //      in stderr.
+      //
+      // For case B we have to scrape the stderr tail buffer, which
+      // we snapshotted before the prompt started so we don't pick
+      // up unrelated errors from prior turns.
+      //
+      // For both cases, if we find evidence of 429 / quota
+      // exhaustion we call applyCredentialCooldown so the cred
+      // card gets its ⏰ countdown chip, even if the user already
+      // saw a generic "unhealthy" message.
+      if (promptPromise && worker) {
         const credIdSnapshot = credentialId;
         const modelSnapshot = requestModel;
+        const workerSnapshot: AcpWorker = worker;
+        const stderrAnchor = stderrAtStart;
         void promptPromise.then(
-          (reply) => {
-            logger.info(
-              `[ACP] Test post-mortem: credential ${credIdSnapshot} eventually succeeded (CLI internal retry recovered after our ${TEST_TIMEOUT_MS / 1000}s timeout). Reply length=${reply.length}. Credential is healthy; cooldown not applied.`,
+          (replyText) => {
+            // Slice off any stderr that was already buffered
+            // before this test — focus on what this prompt produced.
+            const stderrAll = workerSnapshot.getStderrTail();
+            const newStderr = stderrAll.startsWith(stderrAnchor)
+              ? stderrAll.slice(stderrAnchor.length)
+              : stderrAll;
+
+            // Heuristic for "success" vs "silent failure":
+            //   - non-empty reply  → real success, cred is healthy
+            //   - empty reply      → CLI swallowed an upstream error
+            //   - stopReason !== 'end_turn' on empty also implicates
+            const looksHealthy =
+              replyText.trim().length > 0 && stopReason === 'end_turn';
+
+            if (looksHealthy) {
+              logger.info(
+                `[ACP] Test post-mortem: credential ${credIdSnapshot} eventually succeeded (CLI internal retry recovered after our ${TEST_TIMEOUT_MS / 1000}s timeout). Reply length=${replyText.length}, stopReason=${stopReason}. Credential is healthy; cooldown not applied.`,
+              );
+              return;
+            }
+
+            // Empty / unusual response. Scrape the stderr buffer
+            // for the most informative line — usually contains a
+            // JSON blob with the real RESOURCE_EXHAUSTED status.
+            const cooldownMs = parseQuotaResetMs(newStderr);
+            const sample = newStderr.trim().split('\n').slice(-5).join(' | ');
+            logger.warn(
+              `[ACP] Test post-mortem: credential ${credIdSnapshot} resolved with empty reply (length=${replyText.length}, stopReason=${stopReason ?? 'unknown'}). Scraping stderr — last lines: ${sample.slice(0, 400)}`,
             );
+
+            if (typeof cooldownMs === 'number' && cooldownMs > Date.now()) {
+              // Synthesize a fake error string so applyCredential
+              // Cooldown's existing parsers (status code, message
+              // text) can pick the right cooldown duration. We
+              // pass the matched stderr fragment so log lines
+              // remain attributable to the real upstream message.
+              const synthErr = new Error(newStderr.slice(-2048));
+              applyCredentialCooldown(
+                state,
+                credIdSnapshot,
+                modelSnapshot,
+                synthErr,
+              );
+            } else if (
+              /\b(429|RESOURCE_EXHAUSTED|quota|rate.?limit)\b/i.test(newStderr)
+            ) {
+              // Stderr clearly mentions quota but no parsable
+              // timestamp — fall back to applyCredentialCooldown's
+              // 4 h default. Pass the synthesized error so the
+              // status-code path inside applyCredentialCooldown
+              // picks the quota branch.
+              const synthErr = new Error(
+                'RESOURCE_EXHAUSTED (inferred from CLI stderr): ' +
+                  newStderr.slice(-1024),
+              );
+              applyCredentialCooldown(
+                state,
+                credIdSnapshot,
+                modelSnapshot,
+                synthErr,
+              );
+            } else {
+              // Empty reply but no quota markers in stderr — apply
+              // a short conservative cooldown (CREDENTIAL_COOLDOWN_MS
+              // = 60 s) so we don't keep slamming an obviously sick
+              // credential on every test, but recover quickly if it
+              // was just a hiccup.
+              const synthErr = new Error(
+                'CLI returned empty reply (likely upstream error swallowed by CLI): ' +
+                  newStderr.slice(-512),
+              );
+              applyCredentialCooldown(
+                state,
+                credIdSnapshot,
+                modelSnapshot,
+                synthErr,
+              );
+            }
           },
           (postErr: unknown) => {
             const postMsg = extractErrorMessage(postErr);

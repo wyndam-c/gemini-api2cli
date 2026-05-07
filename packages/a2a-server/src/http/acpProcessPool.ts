@@ -210,6 +210,14 @@ export class AcpWorker {
   // admin console's expandable per-worker detail panel.
   private recentPrompts: AcpPromptRecord[] = [];
   private nextPromptSeq = 1;
+  // Recent stderr from the CLI subprocess. Bounded so a chatty CLI
+  // can't grow this unbounded. The test endpoint reads this after
+  // a failed prompt to surface the real Google error (429, RESOURCE
+  // _EXHAUSTED, etc.) — the CLI tends to swallow API errors and
+  // resolve prompt() with an empty reply, so stderr is usually the
+  // only signal that something went wrong.
+  private stderrTail = '';
+  private static readonly MAX_STDERR_TAIL = 16 * 1024; // 16 KB
   // Background timer firing keepalive auth refreshes. See
   // {@link AcpPoolSettings.keepaliveIntervalMs} for rationale.
   private keepaliveTimer: ReturnType<typeof setInterval> | undefined;
@@ -250,6 +258,15 @@ export class AcpWorker {
 
   getSessions(): AcpSessionInfo[] {
     return Array.from(this.sessions.values());
+  }
+
+  /**
+   * Snapshot of the bounded stderr tail. Used by the credential-test
+   * post-mortem to recover the real upstream error when the CLI has
+   * swallowed it.
+   */
+  getStderrTail(): string {
+    return this.stderrTail;
   }
 
   /**
@@ -315,11 +332,26 @@ export class AcpWorker {
       stdio: ['pipe', 'pipe', 'pipe'],
     }) as unknown as ChildProcessWithoutNullStreams;
 
-    // Log stderr in real-time
+    // Log stderr in real-time AND keep a bounded tail buffer that
+    // the credential-test post-mortem can scrape for "429" /
+    // "RESOURCE_EXHAUSTED" markers when the CLI swallows the real
+    // error and resolves prompt() with an empty reply.
     let stderrBuf = '';
     this.child.stderr.on('data', (chunk: Buffer) => {
       const text = chunk.toString();
       stderrBuf += text;
+      // Append to per-worker tail and truncate to the cap. We trim
+      // at line boundaries when possible so log scraping doesn't
+      // hit a half-line at the start.
+      this.stderrTail += text;
+      if (this.stderrTail.length > AcpWorker.MAX_STDERR_TAIL) {
+        const overflow =
+          this.stderrTail.length - AcpWorker.MAX_STDERR_TAIL;
+        const sliceFrom = this.stderrTail.indexOf('\n', overflow);
+        this.stderrTail = this.stderrTail.slice(
+          sliceFrom > 0 ? sliceFrom + 1 : overflow,
+        );
+      }
       logger.error(`[ACP][stderr] ${text.trim()}`);
     });
 
